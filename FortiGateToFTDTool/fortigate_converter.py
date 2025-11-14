@@ -35,18 +35,23 @@
 # EXPECTED YAML FORMAT:
 #     The script expects FortiGate configuration in YAML format like:
     
-#     firewall:
-#       address:
-#         - name: "Server1"
-#           subnet: "192.168.1.10 255.255.255.255"
-#           comment: "Production web server"
-#         - name: "Network1"
-#           subnet: "10.0.0.0 255.255.0.0"
-#         - name: "ServerRange"
-#           start-ip: "192.168.1.10"
-#           end-ip: "192.168.1.20"
-#         - name: "WebServer"
-#           fqdn: "www.example.com"
+#     firewall_address:
+#         - SSLVPN_TUNNEL_ADDR1:
+#             uuid: d9a8d716-c01c-51e8-8211-e6f2d6bbbeb6
+#             type: iprange
+#             start-ip: 10.212.134.200
+#             end-ip: 10.212.134.210
+#         - LE-LO_IP-KVM:
+#             uuid: 8dacf82a-c025-51e8-d369-474978483f63
+#             associated-interface: "port2"
+#             subnet: [10.0.0.4, 255.255.255.252]
+#         - LE-POT_502-Rng:
+#             uuid: 8de6f3fe-c025-51e8-2ed9-2728a00114e7
+#             subnet: [10.0.2.0, 255.255.255.0]
+#         - L_BLOCK_EAST_SVRS:
+#             uuid: 9a1f0206-c025-51e8-4276-05657d04ce42
+#             comment: "FUN"
+#             subnet: [10.0.22.0, 255.255.255.0]
 ""
 
 import yaml
@@ -97,105 +102,125 @@ class FortiGateToFTDConverter:
         # If no addresses found, return empty list
         if not addresses:
             print("Warning: No address objects found in FortiGate configuration")
+            print("  Expected key: 'firewall_address'")
             return []
         
         network_objects = []
         
-        # Process each FortiGate address object
-        for addr in addresses:
+         # Process each FortiGate address object
+        # Each 'addr_dict' looks like: {'OBJECT_NAME': {properties}}
+        for addr_dict in addresses:
+            # Extract the object name (it's the only key in the dictionary)
+            # Example: {'SSLVPN_TUNNEL_ADDR1': {uuid: ..., type: ...}}
+            object_name = list(addr_dict.keys())[0]
+
+            # Extract the properties (the value associated with the object name)
+            properties = addr_dict[object_name]
+            
             # Create FTD network object structure
             # FTD FDM API expects objects in this specific format
             ftd_object = {
-                "name": addr.get('name', 'Unnamed'),  # Object name (required by FTD)
-                "description": addr.get('comment', ''),  # Optional description
+                "name": object_name,  # The object name from the YAML key
+                "description": properties.get('comment', ''),  # Optional description
                 "type": "networkobject",  # FTD object type (always 'networkobject' for addresses)
-                "subType": self._determine_address_type(addr),  # Specific address type (HOST, NETWORK, etc.)
-                "value": self._extract_address_value(addr)  # The actual IP/network/FQDN value
+                "subType": self._determine_address_type(properties),  # Specific address type (HOST, NETWORK, RANGE)
+                "value": self._extract_address_value(properties)  # The actual IP/network/range value
             }
             
             network_objects.append(ftd_object)
             
             # Print conversion details for user visibility
-            print(f"  Converted: {addr.get('name')} -> {ftd_object['subType']} ({ftd_object['value']})")
+            print(f"  Converted: {object_name} -> {ftd_object['subType']} ({ftd_object['value']})")
         
         return network_objects
     
-    def _determine_address_type(self, addr: Dict) -> str:
+    def _determine_address_type(self, properties: Dict) -> str:
         """
         Determine the FTD address subType based on FortiGate address format.
         
+        
+        - If 'type' field exists and equals 'iprange' -> RANGE
+        - If 'subnet' field exists:
+            - Check if netmask is 255.255.255.255 -> HOST
+            - Otherwise -> NETWORK
+        
         FTD supports different address subtypes:
-        - HOST: Single IP address (e.g., 192.168.1.10)
+        - HOST: Single IP address (e.g., 192.168.1.10/32)
         - NETWORK: Network with CIDR notation (e.g., 192.168.1.0/24)
         - RANGE: IP address range (e.g., 192.168.1.10-192.168.1.20)
-        - FQDN: Domain name (e.g., www.example.com)
         
         Args:
-            addr: Dictionary containing FortiGate address object data
+            properties: Dictionary containing FortiGate address object properties
             
         Returns:
             String representing FTD subType
         """
-        # Check which format the FortiGate address uses
-        if 'subnet' in addr:
-            # FortiGate subnet format: "IP NETMASK"
-            # We'll convert this to CIDR for FTD
-            subnet_value = addr['subnet']
-            # Check if it's a host (/32) or actual network
-            if '255.255.255.255' in subnet_value:
-                return "HOST"
+        # Check if this is explicitly marked as an IP range
+        if properties.get('type') == 'iprange':
+            return "RANGE"
+        
+        # Check if subnet field exists
+        elif 'subnet' in properties:
+            # Subnet is a list: [IP, NETMASK]
+            # Example: [10.0.0.4, 255.255.255.252] or [10.0.2.0, 255.255.255.0]
+            subnet_list = properties['subnet']
+            if len(subnet_list) >= 2:
+                netmask = str(subnet_list[1])
+                # If netmask is 255.255.255.255, it's a single host
+                if netmask == '255.255.255.255':
+                    return "HOST"
+                else:
+                    return "NETWORK"
             else:
                 return "NETWORK"
-        elif 'start-ip' in addr and 'end-ip' in addr:
-            # FortiGate IP range format
-            return "RANGE"
-        elif 'fqdn' in addr:
-            # FortiGate FQDN format
-            return "FQDN"
+        
         else:
             # Default to HOST if we can't determine type
             return "HOST"
     
-    def _extract_address_value(self, addr: Dict) -> str:
+    def _extract_address_value(self, properties: Dict) -> str:
         """
         Extract and format the address value from FortiGate format to FTD format.
         
-        This method converts FortiGate's address notation to FTD's expected format:
-        - FortiGate uses "IP NETMASK" -> FTD uses "IP/CIDR"
-        - FortiGate uses separate start-ip/end-ip -> FTD uses "IP1-IP2"
+        NEW LOGIC based on actual FortiGate YAML structure:
+        - For iprange type: Extract start-ip and end-ip, format as "IP1-IP2"
+        - For subnet: Extract from list [IP, NETMASK], convert to "IP/CIDR"
         
         Args:
-            addr: Dictionary containing FortiGate address object data
+            properties: Dictionary containing FortiGate address object properties
             
         Returns:
             Formatted string value suitable for FTD
         """
-        if 'subnet' in addr:
-            # FortiGate subnet format: "192.168.1.0 255.255.255.0"
-            # We need to convert to CIDR: "192.168.1.0/24"
-            subnet_parts = addr['subnet'].split()
-            if len(subnet_parts) == 2:
-                ip_addr = subnet_parts[0]
-                netmask = subnet_parts[1]
+        # Check if this is an IP range type
+        if properties.get('type') == 'iprange':
+            # Extract start and end IPs
+            start_ip = properties.get('start-ip', '')
+            end_ip = properties.get('end-ip', '')
+            # FTD expects: "192.168.1.10-192.168.1.20"
+            return f"{start_ip}-{end_ip}"
+        
+        # Check if this has a subnet field
+        elif 'subnet' in properties:
+            # FortiGate subnet format is a list: [IP, NETMASK]
+            # Example: [10.0.0.4, 255.255.255.252] or [10.0.2.0, 255.255.255.0]
+            subnet_list = properties['subnet']
+            
+            if len(subnet_list) >= 2:
+                ip_addr = str(subnet_list[0])
+                netmask = str(subnet_list[1])
                 # Convert netmask to CIDR notation
                 cidr = self._netmask_to_cidr(netmask)
+                # FTD expects: "10.0.0.4/30" or "10.0.2.0/24"
                 return f"{ip_addr}/{cidr}"
             else:
-                # If format is unexpected, return as-is
-                return addr['subnet']
-        
-        elif 'start-ip' in addr and 'end-ip' in addr:
-            # FortiGate range format: separate start-ip and end-ip fields
-            # FTD expects: "192.168.1.10-192.168.1.20"
-            return f"{addr['start-ip']}-{addr['end-ip']}"
-        
-        elif 'fqdn' in addr:
-            # FQDN format is the same in both systems
-            return addr['fqdn']
+                # If format is unexpected, return first element
+                return str(subnet_list[0]) if subnet_list else ''
         
         else:
-            # Fallback: check for generic 'ip' field or return empty string
-            return addr.get('ip', '')
+            # Fallback: return empty string if no recognized format
+            print(f"  Warning: Could not extract address value from properties: {properties}")
+            return ''
     
     def _netmask_to_cidr(self, netmask: str) -> int:
         """
