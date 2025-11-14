@@ -92,7 +92,7 @@ class FortiGateToFTDConverter:
         """
         # Navigate through the FortiGate config structure to find address objects
         # .get() is used to safely access nested keys without errors if they don't exist
-        addresses = self.fg_config.get('firewall', {}).get('address', [])
+        addresses = self.fg_config.get('firewall_address', {})
         
         # If no addresses found, return empty list
         if not addresses:
