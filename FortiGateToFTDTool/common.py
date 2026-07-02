@@ -31,6 +31,11 @@ DEFAULT_FORTIGATE_SERVICE_OBJECTS = frozenset({
     "all_icmp",
     "all_icmp6",
     "all_icmp_type",
+    # Factory-default IP-protocol services (no ports - nothing to migrate).
+    "gre",
+    "ah",
+    "esp",
+    "ospf",
 })
 
 
@@ -42,6 +47,82 @@ def is_default_fortigate_address(name: str) -> bool:
 def is_default_fortigate_service(name: str) -> bool:
     """Return True if *name* is a FortiGate factory-default service object."""
     return name is not None and str(name).strip().lower() in DEFAULT_FORTIGATE_SERVICE_OBJECTS
+
+
+# Conventional FortiGate names for the dedicated management and HA interfaces.
+MGMT_HA_INTERFACE_NAMES = frozenset({
+    "mgmt", "mgmt1", "mgmt2", "management", "ha", "ha1", "ha2",
+})
+
+
+def _interface_name_list(value: Any) -> List[str]:
+    """Normalize a FortiGate interface-list value to a list of names.
+
+    May be a list, a single string, or a space-separated string (e.g.
+    'member' or HA 'hbdev').
+    """
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, list):
+        return [str(m) for m in value]
+    return []
+
+
+def collect_mgmt_ha_interfaces(fg_config: Dict[str, Any]) -> set:
+    """Return the lowercase names of dedicated management and HA interfaces.
+
+    These are infrastructure links on the FortiGate side (out-of-band
+    management, HA heartbeat/session-sync) that have no meaning on the target
+    firewall, so converters silently ignore them instead of reporting them as
+    skipped/failed items. Detected from:
+      - conventional interface names (mgmt, mgmt1, ha1, ...)
+      - ``set dedicated-to management`` on the interface
+      - ``config system ha`` fields (hbdev, ha-mgmt-interface, session-sync-dev)
+    """
+    special: set = set()
+
+    for intf_dict in fg_config.get("system_interface", []) or []:
+        if not isinstance(intf_dict, dict) or not intf_dict:
+            continue
+        name = next(iter(intf_dict))
+        props = intf_dict[name]
+        nm = str(name).strip().lower()
+        if nm in MGMT_HA_INTERFACE_NAMES:
+            special.add(nm)
+            continue
+        if not isinstance(props, dict):
+            continue
+        dedicated = str(
+            props.get("dedicated-to", props.get("dedicated_to", "")),
+        ).strip().lower()
+        if dedicated == "management":
+            special.add(nm)
+
+    # HA heartbeat / HA-management ports from `config system ha`. The YAML
+    # parser may emit this section as a plain dict, a list holding the
+    # settings dict, or a list of single-key wrapper dicts, so check every
+    # dict at both levels. hbdev can interleave interface names with numeric
+    # priorities (e.g. "port10 50 port9 50"), so drop pure-number tokens.
+    ha_cfg = fg_config.get("system_ha")
+    ha_sections: List[Dict[str, Any]] = []
+    if isinstance(ha_cfg, dict):
+        ha_sections.append(ha_cfg)
+    elif isinstance(ha_cfg, list):
+        for entry in ha_cfg:
+            if not isinstance(entry, dict):
+                continue
+            ha_sections.append(entry)
+            ha_sections.extend(v for v in entry.values() if isinstance(v, dict))
+    for section in ha_sections:
+        for field in (
+            "hbdev", "ha-mgmt-interface", "ha_mgmt_interface", "session-sync-dev",
+        ):
+            for tok in _interface_name_list(section.get(field, [])):
+                t = tok.strip().lower()
+                if t and not t.isdigit():
+                    special.add(t)
+
+    return special
 
 
 def sanitize_name(name: str) -> str:

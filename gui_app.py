@@ -1783,17 +1783,27 @@ class App(tk.Tk):
                 for m in to_ports(sw_props.get("member", [])):
                     member_set.add(m.strip().lower())
 
-        # HA heartbeat / HA-management ports from `config system ha`. hbdev can
-        # interleave interface names with numeric priorities (e.g.
-        # "port10 50 port9 50"), so drop pure-number tokens.
+        # HA heartbeat / HA-management ports from `config system ha`. The YAML
+        # parser may emit this section as a plain dict, a list holding the
+        # settings dict, or a list of single-key wrapper dicts, so check every
+        # dict at both levels. hbdev can interleave interface names with
+        # numeric priorities (e.g. "port10 50 port9 50"), so drop pure-number
+        # tokens.
         ha_cfg = cfg.get("system_ha")
-        if isinstance(ha_cfg, list):
-            ha_cfg = next((x for x in ha_cfg if isinstance(x, dict)), None)
+        ha_sections: List[Dict[str, Any]] = []
         if isinstance(ha_cfg, dict):
+            ha_sections.append(ha_cfg)
+        elif isinstance(ha_cfg, list):
+            for entry in ha_cfg:
+                if not isinstance(entry, dict):
+                    continue
+                ha_sections.append(entry)
+                ha_sections.extend(v for v in entry.values() if isinstance(v, dict))
+        for section in ha_sections:
             for field in (
                 "hbdev", "ha-mgmt-interface", "ha_mgmt_interface", "session-sync-dev",
             ):
-                for tok in to_ports(ha_cfg.get(field, [])):
+                for tok in to_ports(section.get(field, [])):
                     t = tok.strip().lower()
                     if t and not t.isdigit():
                         special_set.add(t)

@@ -29,6 +29,8 @@ FTD INTERFACE NAME RULES:
 import re
 from typing import Dict, List, Any, Set, Optional
 
+from common import collect_mgmt_ha_interfaces
+
 
 # =============================================================================
 # FIREWALL MODEL DEFINITIONS
@@ -285,6 +287,13 @@ class InterfaceConverter:
                         added to the available pool. 'none' = fixed ports only.
         """
         self.fg_config = fortigate_config
+
+        # Dedicated management and HA heartbeat/session-sync interfaces on the
+        # FortiGate side (mgmt*/ha* names, `set dedicated-to management`,
+        # hbdev/ha-mgmt-interface from `config system ha`). These are
+        # infrastructure links with no FTD equivalent, so they are silently
+        # ignored during conversion instead of being reported as failures.
+        self.mgmt_ha_interfaces = collect_mgmt_ha_interfaces(fortigate_config)
 
         # Set target model (this also sets up port mapping)
         self.target_model = None
@@ -1270,15 +1279,28 @@ class InterfaceConverter:
         for intf_dict in interfaces:
             intf_name = list(intf_dict.keys())[0]
             properties = intf_dict[intf_name]
-            
+
             # Skip non-dict entries
             if not isinstance(properties, dict):
                 continue
-            
+
+            # Silently ignore dedicated management and HA interfaces. These
+            # are FortiGate infrastructure links (out-of-band mgmt, HA
+            # heartbeat/session-sync) with no FTD equivalent, so they are not
+            # reported as skipped/failed items that need attention.
+            if str(intf_name).strip().lower() in self.mgmt_ha_interfaces:
+                print(f"    Ignored: {intf_name} (dedicated management/HA interface)")
+                continue
+
             intf_type = properties.get('type', 'physical')
-            
+
             # Check if this is a VLAN interface (has 'interface' and 'vlanid')
             if 'interface' in properties and 'vlanid' in properties:
+                parent_name = str(properties.get('interface', '')).strip().lower()
+                if parent_name in self.mgmt_ha_interfaces:
+                    print(f"    Ignored: {intf_name} (subinterface of management/HA "
+                          f"interface '{properties.get('interface')}')")
+                    continue
                 vlan_interfaces.append((intf_name, properties))
             elif intf_type == 'aggregate':
                 aggregate_ports.append((intf_name, properties))

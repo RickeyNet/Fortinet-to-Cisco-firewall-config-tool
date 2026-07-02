@@ -55,7 +55,7 @@ PA-440 hardware reference:
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from pa_common import sanitize_name, netmask_to_cidr
+from pa_common import sanitize_name, netmask_to_cidr, collect_mgmt_ha_interfaces
 
 
 # PA model definitions
@@ -148,6 +148,14 @@ class PAInterfaceConverter:
         self.target_model = target_model
         self.model_info = PA_MODELS.get(target_model, PA_MODELS["pa-440"])
         self.total_ports = self.model_info["total_ports"]
+
+        # Dedicated management and HA heartbeat/session-sync interfaces on the
+        # FortiGate side (mgmt*/ha* names, `set dedicated-to management`,
+        # hbdev/ha-mgmt-interface from `config system ha`). These are
+        # infrastructure links with no PAN-OS data-plane equivalent, so they
+        # are silently ignored during conversion instead of being reported as
+        # failures.
+        self._mgmt_ha_interfaces = collect_mgmt_ha_interfaces(fortigate_config)
 
         # Outputs
         self.pa_interfaces: List[Dict] = []  # Physical + aggregate + subinterface configs
@@ -266,6 +274,14 @@ class PAInterfaceConverter:
                 self._stats["skipped"] += 1
                 continue
 
+            # Silently ignore dedicated management and HA interfaces. These
+            # are FortiGate infrastructure links (out-of-band mgmt, HA
+            # heartbeat/session-sync) with no PAN-OS data-plane equivalent,
+            # so they are not reported as skipped/failed items.
+            if intf_name.strip().lower() in self._mgmt_ha_interfaces:
+                print(f"    Ignored: {intf_name} (dedicated management/HA interface)")
+                continue
+
             # Skip special FortiGate interfaces
             if intf_name.startswith("vw") or (intf_name.startswith("s") and len(intf_name) <= 2):
                 print(f"    Skipped: {intf_name} (special port)")
@@ -288,6 +304,11 @@ class PAInterfaceConverter:
 
             # Categorize
             if "interface" in properties and "vlanid" in properties:
+                parent_name = str(properties.get("interface", "")).strip().lower()
+                if parent_name in self._mgmt_ha_interfaces:
+                    print(f"    Ignored: {intf_name} (subinterface of management/HA "
+                          f"interface '{properties.get('interface')}')")
+                    continue
                 vlan_interfaces.append((intf_name, properties))
             elif intf_type == "aggregate":
                 aggregate_ports.append((intf_name, properties))

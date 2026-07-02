@@ -1,28 +1,10 @@
 # Release Notes
 
-## v1.6.0 - Interface Scale-Up for FortiGate -> Palo Alto
+## v1.6.0 - Link Aggregation Scale-Up (FTD & Palo Alto), SNMPv3, VLAN Conflict Resolution
 
 ### Overview
 
-Brings the FortiGate -> FTD interface scale-up to the FortiGate -> Palo Alto path. The same four options (expand/promote a port channel, expand/promote a bridge group) now work when the target is PAN-OS, mapped to the closest PAN-OS constructs, and the GUI Interface Aggregation builder is now shown for FortiGate -> Palo Alto as well.
-
-### New Features
-
-**Scale up interfaces during FortiGate -> Palo Alto migration**
-
-The four converter flags now also work in `pa_converter.py`, mapped to PAN-OS equivalents:
-
-- **Port channel -> aggregate-ethernet (`--expand-portchannel`, `--promote-portchannel`)** - Grow an existing FortiGate aggregate to more `aggregate-ethernet` (LACP) members, or promote a plain physical interface into a NEW `ae`. SPEC is a target total member count or a comma-separated list of PAN-OS ports to add (e.g. `ethernet1/5,ethernet1/6`). Unlike FTD (where the port channel is left IP-less), the IP/MTU stay on the `ae` - in PAN-OS the aggregate-ethernet is itself the Layer-3 interface.
-- **Bridge group -> Layer-2 VLAN segment (`--expand-bridgegroup`, `--promote-bridgegroup`)** - PAN-OS has no BVI, so a FortiGate virtual switch (`system_switch-interface`) is now converted to a Layer-2 segment instead of being skipped: member ports become `layer2` interfaces grouped in a VLAN object, and the switch's IP moves onto a `vlan.N` interface (the SVI, the Layer-3 analog of an FTD bridge group). Expansion adds more Layer-2 members; promotion turns a plain physical interface into a new Layer-2 segment with its IP on the SVI. Members land in a dedicated Layer-2 security zone; the SVI lands in a Layer-3 zone, so routes and policies that reference the switch resolve to `vlan.N`.
-- **Importer support** - The PAN-OS XML importer gained builders and XPaths for the new interface types (`layer2-member`, `vlan-object`, `vlan-interface`) and now emits `layer2` zones in addition to `layer3` zones.
-- **GUI** - The Interface Aggregation builder on the Convert tab is now shown for FortiGate -> Palo Alto as well as FortiGate -> FTD. The section label and port-format hints retarget to the active platform (`ethernet1/5` for PAN-OS). The same Expand/Promote x Port-Channel/Bridge-Group rows drive both targets.
-- **Default behavior is unchanged** when none of the flags are used, except that FortiGate switch interfaces, previously dropped on the PAN-OS path, now convert to Layer-2 VLAN segments.
-
-## v1.6.0 - Link Aggregation Scale-Up, SNMPv3, VLAN Conflict Resolution
-
-### Overview
-
-Adds the ability to scale up link aggregation during FortiGate -> FTD migration - grow port channels, promote plain physical interfaces into new port channels, and grow virtual-switch bridge groups with extra 10G member links. Also includes STIG-compliant SNMPv3 push for FDM-managed FTDs, automatic VLAN conflict resolution, restricted build profiles for cleanup-free executables, an expanded GUI theme set, tightened importer update-on-existing logic, and interface conversion/cleanup reliability fixes.
+Adds the ability to scale up link aggregation during migration - grow port channels, promote plain physical interfaces into new port channels, and grow virtual-switch bridge groups with extra member links - on both the FortiGate -> FTD and FortiGate -> Palo Alto paths (mapped to the closest PAN-OS constructs on the Palo Alto side). Also includes STIG-compliant SNMPv3 push for FDM-managed FTDs, automatic VLAN conflict resolution, restricted build profiles for cleanup-free executables, an expanded GUI theme set, tightened importer update-on-existing logic, quieter conversion summaries (management/HA ports and factory-default services are ignored instead of reported as failures), and interface conversion/cleanup reliability fixes.
 
 ### New Features
 
@@ -34,8 +16,18 @@ Previously interface membership was copied 1:1 from the source. Three new option
 - **Physical interface -> EtherChannel promotion (`--promote-portchannel`)** - Migrate a plain (non-aggregate) FortiGate physical interface as a NEW FTD EtherChannel so it can carry multiple 10G links. The original FTD port becomes the first member and extra members are added per SPEC. The interface's MTU moves onto the port channel, which is left without an IP - in this design L3 addresses live on the VLAN subinterfaces riding on the channel. Interfaces that carry VLAN subinterfaces are not eligible (they convert normally with a warning).
 - **Bridge group member expansion (`--expand-bridgegroup`)** - Grow a FortiGate virtual switch (`system_switch-interface`) -> FTD bridge group (BVI) with more member links. SPEC is a target total member count or an explicit list of FTD ports to add. Added members get unique names, routed mode, and join the bridge group's security zone; the IP correctly stays on the BVI (bridge groups are L3, unlike port channels).
 - **Physical interface -> bridge group promotion (`--promote-bridgegroup`)** - Migrate a plain FortiGate physical interface as a NEW FTD bridge group (BVI) so its subnet can span several bridged ports on the Cisco side. The original FTD port becomes the first member and extra members are added per SPEC. Unlike port-channel promotion, the interface's IP and MTU move onto the BVI (a bridge group is the Layer-3 interface for the bridged segment). Interfaces with VLAN subinterfaces are not eligible.
-- **Interface Aggregation builder (GUI)** - In the GUI these four options are driven by a single per-interface builder on the Convert tab, shown only for FortiGate -> FTD migrations. Add a row per interface, pick the interface from a dropdown, and supply a member count or explicit port list; the builder auto-detects Expand vs Promote and Port-Channel vs Bridge Group from the interface's type (both remain editable to override). The dropdown is populated by parsing the selected FortiGate config and lists only valid targets - it shows each interface's logical name (`alias`) when present and hides interfaces that aren't aggregatable: existing port-channel/bridge-group member ports (only the parent is shown), the dedicated management port (`set dedicated-to management` or a conventional `mgmt*` name), and HA ports (`hbdev`/`ha-mgmt-interface` from `config system ha`, or a conventional `ha*` name). Refresh notifications use a themed dialog that matches the active GUI theme.
+- **Interface Aggregation builder (GUI)** - In the GUI these four options are driven by a single per-interface builder on the Convert tab. Add a row per interface, pick the interface from a dropdown, and supply a member count or explicit port list; the builder auto-detects Expand vs Promote and Port-Channel vs Bridge Group from the interface's type (both remain editable to override). The dropdown is populated by parsing the selected FortiGate config and lists only valid targets - it shows each interface's logical name (`alias`) when present and hides interfaces that aren't aggregatable: existing port-channel/bridge-group member ports (only the parent is shown), the dedicated management port (`set dedicated-to management` or a conventional `mgmt*` name), and HA ports (`hbdev`/`ha-mgmt-interface` from `config system ha`, or a conventional `ha*` name). Refresh notifications use a themed dialog that matches the active GUI theme.
 - **Shared guardrails** - Out-of-range, malformed, or already-assigned ports are warned and skipped, and the conversion's Port Analysis estimate accounts for the extra members. Default behavior is unchanged when none of these options are used.
+
+**Scale up interfaces during FortiGate -> Palo Alto migration**
+
+The same four converter flags also work in `pa_converter.py`, mapped to PAN-OS equivalents:
+
+- **Port channel -> aggregate-ethernet (`--expand-portchannel`, `--promote-portchannel`)** - Grow an existing FortiGate aggregate to more `aggregate-ethernet` (LACP) members, or promote a plain physical interface into a NEW `ae`. SPEC is a target total member count or a comma-separated list of PAN-OS ports to add (e.g. `ethernet1/5,ethernet1/6`). Unlike FTD (where the port channel is left IP-less), the IP/MTU stay on the `ae` - in PAN-OS the aggregate-ethernet is itself the Layer-3 interface.
+- **Bridge group -> Layer-2 VLAN segment (`--expand-bridgegroup`, `--promote-bridgegroup`)** - PAN-OS has no BVI, so a FortiGate virtual switch (`system_switch-interface`) is now converted to a Layer-2 segment instead of being skipped: member ports become `layer2` interfaces grouped in a VLAN object, and the switch's IP moves onto a `vlan.N` interface (the SVI, the Layer-3 analog of an FTD bridge group). Expansion adds more Layer-2 members; promotion turns a plain physical interface into a new Layer-2 segment with its IP on the SVI. Members land in a dedicated Layer-2 security zone; the SVI lands in a Layer-3 zone, so routes and policies that reference the switch resolve to `vlan.N`.
+- **Importer support** - The PAN-OS XML importer gained builders and XPaths for the new interface types (`layer2-member`, `vlan-object`, `vlan-interface`) and now emits `layer2` zones in addition to `layer3` zones.
+- **GUI** - The Interface Aggregation builder on the Convert tab is shown for FortiGate -> Palo Alto as well as FortiGate -> FTD. The section label and port-format hints retarget to the active platform (`ethernet1/5` for PAN-OS). The same Expand/Promote x Port-Channel/Bridge-Group rows drive both targets.
+- **Default behavior is unchanged** when none of the flags are used, except that FortiGate switch interfaces, previously dropped on the PAN-OS path, now convert to Layer-2 VLAN segments.
 
 **SNMPv3 configuration for FDM-managed FTD (new SNMP tab + CLI)**
 
@@ -79,6 +71,11 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 - Read-only `links` metadata is stripped from the disable PUT so FDM does not reject it.
 
 ### Improvements
+
+**Conversion - FortiGate infrastructure ports and factory-default services ignored (FTD & Palo Alto)**
+
+- **Dedicated management and HA ports are no longer converted** - The dedicated management port (`set dedicated-to management`, or a conventional `mgmt*`/`management` name) and HA heartbeat/HA-management/session-sync ports (`hbdev`, `ha-mgmt-interface`, `session-sync-dev` from `config system ha`, or a conventional `ha*` name) are FortiGate infrastructure links with no equivalent on the target firewall. Previously only interfaces named exactly `ha` or `mgmt` were skipped - and even those were reported as failures - so ports like `mgmt1` or hbdev members were converted (consuming a target port) or failed into the conversion summary. They are now printed as `Ignored` during conversion and excluded from the failed-items summary. VLAN subinterfaces riding on an ignored port are ignored with them. The GUI Interface Aggregation builder already hid these ports from its dropdown; the converters now use the same detection, and the `config system ha` parsing handles every YAML shape the parser can emit.
+- **More factory-default services silently ignored** - `NONE`, `GRE`, `AH`, `ESP`, and `OSPF` join `ALL`/`ALL_ICMP`/etc. in the factory-default service list: they are ignored during conversion instead of being reported as skipped/failed items. Service groups and policies referencing them are still cleaned up as before. Custom (user-created) non-port services are still reported, since those may need manual attention.
 
 **GUI themes - three new themes, new default, Sandstone redesign**
 
