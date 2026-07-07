@@ -1,10 +1,10 @@
 # Release Notes
 
-## v1.6.0 - Link Aggregation Scale-Up (FTD & Palo Alto), SNMPv3, VLAN Conflict Resolution
+## v1.6.0 - Interface Map/Assign, Disabled Rule Export, ICMP Ping Migration, Simulation Theme
 
 ### Overview
 
-Adds the ability to scale up link aggregation during migration - grow port channels, promote plain physical interfaces into new port channels, and grow virtual-switch bridge groups with extra member links - on both the FortiGate -> FTD and FortiGate -> Palo Alto paths (mapped to the closest PAN-OS constructs on the Palo Alto side). Also includes STIG-compliant SNMPv3 push for FDM-managed FTDs, automatic VLAN conflict resolution, restricted build profiles for cleanup-free executables, an expanded GUI theme set, tightened importer update-on-existing logic, quieter conversion summaries (management/HA ports and factory-default services are ignored instead of reported as failures), and interface conversion/cleanup reliability fixes.
+Adds straight 1:1 port mapping (`--map-port`) alongside the existing scale-up flags, IP-on-VLAN-subinterface for promoted port channels, and ICMP ping -> PING port-object-group migration for the FTD path. Disabled FortiGate policies are now exported to a separate `*_access_rules_disabled.json` file (FDM cannot disable rules), and rules with unresolvable references are skipped/disabled instead of broadening to "any". A new "Simulation" Matrix-themed GUI theme brings digital-rain animation to idle output consoles. EtherChannel scale-up enforces same-speed members on mixed-speed FTD models (3105/3110/3120). Multiple HA ports can now be reserved, with a checkbox port picker in the GUI. The Interface Aggregation builder gained a "Map/Assign" action for 1:1 port assignment and a per-row L3 VLAN field for promote-to-subinterface flows. Factory virtual interfaces (SSL/PPTP/L2TP/NAF per-VDOM tunnels, modem) are ignored silently like mgmt/HA ports. Over 100 code review findings are addressed across all conversion paths, including broken-feature restorations (CiscoFTD->FortiGate static routes, PAN-OS cleanup, PA->FG policies), API/security hardening (working `--verify-ssl`, honest exit codes, pagination fixes, token-refresh thread race fix, deploy polling to terminal state), and converter correctness fixes (TRUST rules map to accept, source port syntax, name-collision rename propagation, topological group ordering, ASA object-NAT/inline-subnet/neq/tcp-udp fixes).
 
 ### New Features
 
@@ -18,6 +18,38 @@ Previously interface membership was copied 1:1 from the source. Three new option
 - **Physical interface -> bridge group promotion (`--promote-bridgegroup`)** - Migrate a plain FortiGate physical interface as a NEW FTD bridge group (BVI) so its subnet can span several bridged ports on the Cisco side. The original FTD port becomes the first member and extra members are added per SPEC. Unlike port-channel promotion, the interface's IP and MTU move onto the BVI (a bridge group is the Layer-3 interface for the bridged segment). Interfaces with VLAN subinterfaces are not eligible.
 - **Interface Aggregation builder (GUI)** - In the GUI these four options are driven by a single per-interface builder on the Convert tab. Add a row per interface, pick the interface from a dropdown, and supply a member count or explicit port list; the builder auto-detects Expand vs Promote and Port-Channel vs Bridge Group from the interface's type (both remain editable to override). The dropdown is populated by parsing the selected FortiGate config and lists only valid targets - it shows each interface's logical name (`alias`) when present and hides interfaces that aren't aggregatable: existing port-channel/bridge-group member ports (only the parent is shown), the dedicated management port (`set dedicated-to management` or a conventional `mgmt*` name), and HA ports (`hbdev`/`ha-mgmt-interface` from `config system ha`, or a conventional `ha*` name). Refresh notifications use a themed dialog that matches the active GUI theme.
 - **Shared guardrails** - Out-of-range, malformed, or already-assigned ports are warned and skipped, and the conversion's Port Analysis estimate accounts for the extra members. Default behavior is unchanged when none of these options are used.
+
+**Map/Assign interface port mapping (`--map-port`)**
+
+- New straight 1:1 port assignment alongside the aggregation options. `--map-port IFACE=PORT` on both the FTD and PA tools maps a single FortiGate physical interface to a specific target port without creating any aggregate. Available as a third per-row action in the Interface Aggregation builder (labeled "Map / Assign") with a single-port picker.
+
+**Promote IP to VLAN subinterface (`--promote-portchannel-vlan`)**
+
+- When promoting a physical interface to a port channel, the source IP now optionally moves onto a VLAN subinterface riding on the channel instead of being dropped. New `--promote-portchannel-vlan IFACE=TAG` flag and per-row L3 VLAN field in the GUI: the IP lands on `Port-channelN.tag` (FTD) / `aeN.tag` (PA), the channel stays IP-less, and routes/policies are re-pointed to the subinterface. With no tag the IP is applied directly to the routed channel (lossless fallback).
+
+**Explicit port list = exact members for promotion**
+
+- For promotion (both port-channel and bridge-group), listing explicit ports now makes those the **exact** member ports - no extra auto-assigned port is added. An integer spec (e.g. "3 ports") keeps the old behavior: the interface's own port plus auto-assigned extras to reach the count. A new `_prereserve_explicit_ports()` pass holds all explicitly-listed ports out of the greedy auto-assign pool so the owning aggregate can claim them.
+
+**ICMP ping -> PING port object group (FTD)**
+
+- FortiGate ICMP "ping" services (named `PING` or icmptype 8) now migrate to two FTD ICMPv4 port objects (`ICMP_Echo_Request`, `ICMP_Echo_Reply`) grouped into a `PING` portobjectgroup. The objects and group are built once regardless of how many ping services exist, and every policy or service group referencing the ping service resolves to the two echo objects.
+
+**Disabled rule export (all paths)**
+
+- FortiGate policies with `status: disable` convert as disabled on every target path: PAN-OS rules get `disabled=yes`; the FTD path exports them fully converted to a new `*_access_rules_disabled.json` sidecar file (FDM cannot disable rules - importing one would activate it); ASA `inactive` ACEs convert disabled.
+
+**Multiple HA port reservation (FTD)**
+
+- `--ha-port` now accepts multiple ports as a comma/space-separated list (e.g. `Ethernet1/2,Ethernet1/3`), reserving every listed port and excluding all from the data-interface pool. The GUI HA field is widened and accepts the same multi-port format; a new checkbox port picker lets users select HA ports interactively. `self.ha_port` is kept as a back-compat alias for the first port. `none` and the model default behave as before.
+
+**FTD network module / interface layout support**
+
+- FTD models with optional network modules now expose their full port layout. Interface assignments, HA port reservations, and the GUI port picker all respect the model's actual interface inventory instead of assuming a flat port range.
+
+**EtherChannel member speed consistency**
+
+- On mixed-speed FTD models (3105: 8x1G + 4x10G; 3110/3120: 8x1G + 8x10G), port-channel expansion and promotion now derive the channel's speed band from its existing member(s) and auto-fill only same-speed ports, stopping short with a warning rather than mixing. Explicitly-listed members of the wrong speed are rejected. Bridge groups stay unconstrained (L2 bridging can mix speeds).
 
 **Scale up interfaces during FortiGate -> Palo Alto migration**
 
@@ -56,6 +88,10 @@ FortiGate allows VLAN interfaces on different parents (physical ports, port chan
 
 - New reusable build profiles allow producing limited executables; `--no-cleanup` / `fortigate_to_ftd_no_cleanup` builds omit the Cleanup tab and cleanup-related bundles entirely. The runtime profile carries `features.cleanup`; the GUI and PyInstaller imports respect it.
 
+**FortiGate config export how-to banner**
+
+- The Convert tab now shows an informational banner with step-by-step instructions for exporting a FortiGate config to YAML via the FortiGate CLI, reducing the need to reference external documentation.
+
 ### Fixes
 
 **FTD conversion - bridge group members emitted twice**
@@ -70,6 +106,43 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 - If a DELETE is still rejected with an HA-monitoring error, the cleanup force-disables monitoring and **retries the delete once**; both errors are reported together if it still fails.
 - Read-only `links` metadata is stripped from the disable PUT so FDM does not reject it.
 
+**Fail-closed conversions for unresolvable rules (all paths)**
+
+- Rules whose services or addresses were all filtered or unresolvable are no longer emitted broader than the source (previously became "any service"). They are skipped (FTD), emitted disabled (PAN-OS), or set status disable (FortiGate outputs), always with a summary entry.
+
+**Source port syntax fix (FortiGate -> FTD & PA)**
+
+- FortiGate `dst:src` port syntax in policies was being parsed incorrectly, broadening destination ports. The parser now correctly distinguishes destination and source port specifications.
+
+**Name-collision rename propagation**
+
+- Name-collision renames (e.g. `X_2`) now propagate to all groups and policies referencing the renamed object. Dangling references to skipped objects are filtered everywhere.
+
+**Expand misroute fix**
+
+- The GUI Interface Aggregation builder's action dropdown was defaulting to Promote and only auto-flipping to Expand when the interface was found in the parsed-config index, causing an existing port-channel to be sent as `--promote-portchannel` (which the converter silently ignores). The flag resolution now reads from the interface's known category: an aggregate always produces `--expand-portchannel`, a switch always produces `--expand-bridgegroup`, regardless of the dropdown position.
+
+**Broken features restored (from code review)**
+
+- **CiscoFTD -> FortiGate static routes** - Were 100% silently dropped due to incorrect FDM API field names.
+- **PAN-OS cleanup tool** - Was a complete no-op reporting success without deleting anything.
+- **PA -> FG policies** - Were missing `set schedule "always"`.
+- **Panorama <shared> objects** - Now merged into the converted output.
+- **ASA destination object-group ACEs** - Were silently dropped; now included.
+- **GUI PA cleanup flags** - Fixed argparse mismatch that prevented flags from being passed.
+
+**Various converter fixes (from code review)**
+
+- TRUST rules now correctly map to `accept` (was `deny`).
+- ICMP objects round-trip correctly through conversion.
+- Port literals in policies convert to specific port objects (was widening to ALL).
+- Orphaned VLANs with no valid parent no longer fall back to Ethernet1/1.
+- Topological group ordering ensures groups reference only already-defined members.
+- ASA object-NAT, inline-subnet, neq, and tcp-udp fixes.
+- Interface name-length limits enforced (PA 63, FG policy 35, FG interface 15).
+- Malformed-YAML guards in all converter loops prevent crashes.
+- Factory virtual interfaces (ssl./l2t./naf. per-VDOM tunnels, modem) ignored silently like mgmt/HA ports.
+
 ### Improvements
 
 **Conversion - FortiGate infrastructure ports and factory-default services ignored (FTD & Palo Alto)**
@@ -77,13 +150,14 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 - **Dedicated management and HA ports are no longer converted** - The dedicated management port (`set dedicated-to management`, or a conventional `mgmt*`/`management` name) and HA heartbeat/HA-management/session-sync ports (`hbdev`, `ha-mgmt-interface`, `session-sync-dev` from `config system ha`, or a conventional `ha*` name) are FortiGate infrastructure links with no equivalent on the target firewall. Previously only interfaces named exactly `ha` or `mgmt` were skipped - and even those were reported as failures - so ports like `mgmt1` or hbdev members were converted (consuming a target port) or failed into the conversion summary. They are now printed as `Ignored` during conversion and excluded from the failed-items summary. VLAN subinterfaces riding on an ignored port are ignored with them. The GUI Interface Aggregation builder already hid these ports from its dropdown; the converters now use the same detection, and the `config system ha` parsing handles every YAML shape the parser can emit.
 - **More factory-default services silently ignored** - `NONE`, `GRE`, `AH`, `ESP`, and `OSPF` join `ALL`/`ALL_ICMP`/etc. in the factory-default service list: they are ignored during conversion instead of being reported as skipped/failed items. Service groups and policies referencing them are still cleaned up as before. Custom (user-created) non-port services are still reported, since those may need manual attention.
 
-**GUI themes - three new themes, new default, Sandstone redesign**
+**GUI themes - four new themes, new default, Sandstone redesign**
 
 - **New "Default" theme** - Neutral dark gray with light gray accents; now the theme on launch (previously Coral).
 - **New "Voyager" theme** - Deep navy-blue background with gold accents.
 - **New "Light" theme** - The first light theme: light gray background, white input/output fields, blue accents.
+- **New "Simulation" theme** - Matrix-inspired dark-green palette with digital-rain animation on idle output consoles.
 - **Sandstone redesigned** - Now a dark olive-green palette with warm orange accents and muted green output text, replacing the previous lighter red-accented look.
-- All themes remain switchable live from the dropdown in the top-right corner; help-tab descriptions updated to match.
+- All themes remain switchable live from the dropdown in the top-right corner; help-tab descriptions updated to match; full runtime theme repaint ensures every widget updates instantly.
 
 **How-To Guide - keyword search**
 
@@ -95,10 +169,32 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 - **Non-name duplicates resolve to updates** - When a duplicate is keyed on something other than the object name, the importer now finds and updates the existing object: EtherChannels match on `hardwareName` (Port-channel ID), subinterfaces on `vlanId`/`subIntfId` under the same parent. Exact name matches always take priority.
 - **Cleaner update PUTs** - Read-only `links` metadata is stripped from update payloads.
 
+**API/security hardening (FTD & PAN-OS tools)**
+
+- Working `--verify-ssl` opt-in on all CLIs (`--skip-verify` was a dead flag that never reached the requests call).
+- Honest exit codes - missing files and listing failures no longer return SUCCESS.
+- Pagination fixed in every lookup endpoint.
+- Token-refresh thread race fixed with proper locking.
+- Deploy polling now waits for terminal deployment state instead of exiting prematurely.
+- XML escaping in all PAN-OS payloads prevents injection.
+- API key moved out of GET query strings into POST form bodies.
+- `hmac.compare_digest` used for cleanup password verification.
+
+**GUI - per-platform cleanup options and usability**
+
+- Cleanup option table is now validated against each tool's argparse, so only valid flags are shown for the active source/target combination.
+- Secrets snapshotted off the Tk thread before async worker launch.
+- Confirm-on-close dialog when an operation is in progress.
+- Stale aggregation rows cleared when the target platform changes.
+- Bundled exe no longer looks for Python scripts in its own folder - uses internally-packaged resources.
+
 **Code quality**
 
 - Complete type hints added across the codebase - every function now has parameter and return annotations, with a clean pyright run (0 errors).
 - Non-ASCII dashes (em/en) in documentation and comments normalized to ASCII hyphens.
+- Bare `except:` and broad `except Exception` handlers narrowed to specific exception tuples across all tools.
+- Dead code (unused imports, unused locals) removed.
+- Test suite grew from 22 to 228 passing tests with new conftest.py for reliable import ordering.
 
 ---
 
