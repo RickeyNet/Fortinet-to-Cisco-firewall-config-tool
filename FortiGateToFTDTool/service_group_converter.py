@@ -48,7 +48,7 @@ NOTE ON MEMBER TYPES:
 
 from typing import Dict, List, Any, Optional, Set
 
-from common import sanitize_name, build_group_lookup, flatten_group_members
+from common import sanitize_name, build_group_lookup, flatten_group_members, first_item, dedupe_name
 
 
 class ServiceGroupConverter:
@@ -95,7 +95,14 @@ class ServiceGroupConverter:
 
         # This will store the converted FTD port groups
         self.ftd_port_groups = []
-        
+
+        # Mapping of original sanitized group name -> final FTD group name
+        # (differs when a sanitization collision forced an X_2 rename).
+        self.group_name_mapping: Dict[str, str] = {}
+
+        # Track items that failed/were skipped during conversion
+        self.failed_items = []
+
         # Build a lookup of group name -> member list for flattening nested groups
         self.group_members = build_group_lookup(
             self.fg_config.get('firewall_service_group', [])
@@ -139,23 +146,19 @@ class ServiceGroupConverter:
         # ====================================================================
         for group_dict in service_groups:
             # ================================================================
-            # STEP 2A: Extract the group name
+            # STEP 2A/2B: Extract the group name and properties
             # ================================================================
-            group_name = list(group_dict.keys())[0]
-            sanitized_group_name = sanitize_name(group_name)
+            item = first_item(group_dict)
+            if item is None:
+                print("  Skipped: empty/malformed service group entry")
+                continue
+            group_name, properties = item
+            base_group_name = sanitize_name(group_name)
 
             # Deduplicate: if this name was already used, append _2, _3, etc.
-            if sanitized_group_name in used_names:
-                used_names[sanitized_group_name] += 1
-                sanitized_group_name = f"{sanitized_group_name}_{used_names[sanitized_group_name]}"
-            else:
-                used_names[sanitized_group_name] = 1
+            # (generated names are registered so a literal X_2 can't collide)
+            sanitized_group_name = dedupe_name(base_group_name, used_names)
 
-            # ================================================================
-            # STEP 2B: Extract the group properties
-            # ================================================================
-            properties = group_dict[group_name]
-            
             # ================================================================
             # STEP 2C: Extract and normalize the member list
             # ================================================================
@@ -201,11 +204,6 @@ class ServiceGroupConverter:
                     expanded_members.extend(ftd_objects)
                     if len(ftd_objects) > 1:
                         print(f"    Expanded: {member_name} -> {len(ftd_objects)} objects")
-                elif member_name in self.split_services:
-                    # DEPRECATED: Old way - just add _TCP and _UDP suffixes
-                    expanded_members.append((f"{member_name}_TCP", "tcpportobject"))
-                    expanded_members.append((f"{member_name}_UDP", "udpportobject"))
-                    print(f"    Expanded (legacy): {member_name} -> {member_name}_TCP, {member_name}_UDP")
                 else:
                     # This service was not in our mapping - might be a built-in FTD service
                     # Try to determine type from name, default to TCP
@@ -241,16 +239,30 @@ class ServiceGroupConverter:
             # ================================================================
             # STEP 2H: Create the FTD port group structure
             # ================================================================
+            # FDM rejects groups with no members - skip instead of exporting
+            if not ftd_members:
+                print(f"  Skipped: {group_name} (empty group - no valid members)")
+                self.failed_items.append({
+                    "name": str(group_name),
+                    "reason": "empty group - no members were converted",
+                    "config": properties,
+                })
+                continue
+
+            # Record the rename so policies referencing the original name can
+            # follow it to the final group (first occurrence wins).
+            self.group_name_mapping.setdefault(base_group_name, sanitized_group_name)
+
             ftd_group = {
                 "name": sanitized_group_name,
                 "isSystemDefined": False,
                 "objects": ftd_members,
                 "type": "portobjectgroup"
             }
-            
+
             # Add the converted group to our result list
             port_groups.append(ftd_group)
-            
+
             # ================================================================
             # STEP 2I: Print conversion details for user feedback
             # ================================================================
@@ -298,11 +310,15 @@ class ServiceGroupConverter:
     def get_group_count(self) -> int:
         """
         Get the number of service groups that were converted.
-        
+
         Returns:
             Integer count of converted groups
         """
         return len(self.ftd_port_groups)
+
+    def get_group_name_mapping(self) -> Dict[str, str]:
+        """Return {original sanitized group name: final FTD group name}."""
+        return self.group_name_mapping
 
 
 # =============================================================================

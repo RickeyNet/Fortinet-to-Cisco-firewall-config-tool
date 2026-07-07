@@ -89,36 +89,16 @@ class FTDSNMPConfig(FTDBaseClient):
         return f"HTTP {response.status_code}"
 
     def _get_by_name(self, endpoint: str, name: str) -> Optional[Dict]:
-        """Find an object by name on a list endpoint (filter + paginated scan)."""
-        url = f"{self.base_url}{endpoint}"
-        try:
-            response = self.session.get(
-                url, params={"filter": f"name:{name}", "limit": 10}, timeout=30,
-            )
-            if response.status_code == 200:
-                for obj in response.json().get("items", []):
-                    if obj.get("name") == name:
-                        return obj
+        """Find an object by name on a list endpoint (filter + paginated scan).
 
-            offset = 0
-            limit = 100
-            while True:
-                response = self.session.get(
-                    url, params={"offset": offset, "limit": limit}, timeout=30,
-                )
-                if response.status_code != 200:
-                    return None
-                data = response.json()
-                items = data.get("items", [])
-                for obj in items:
-                    if obj.get("name") == name:
-                        return obj
-                paging = data.get("paging", {})
-                if not items or offset + len(items) >= paging.get("count", len(items)):
-                    return None
-                offset += limit
-        except requests.exceptions.RequestException:
-            return None
+        Delegates to the shared FTDBaseClient.find_object_by_name helper,
+        which advances the scan offset by the actual page size so short
+        pages never cause objects to be missed.
+        """
+        found, obj = self.find_object_by_name(f"{self.base_url}{endpoint}", name)
+        if found and isinstance(obj, dict):
+            return obj
+        return None
 
     def _upsert(self, endpoint: str, payload: Dict, label: str) -> Tuple[bool, Union[Dict, str]]:
         """
@@ -193,43 +173,34 @@ class FTDSNMPConfig(FTDBaseClient):
         physical_parents = []
         ec_parents = []
 
-        # Pass 1: top-level interfaces (and remember parents for pass 2)
+        # Pass 1: top-level interfaces (paginated; remember parents for pass 2)
         for endpoint, parents in (
             ("/devices/default/interfaces", physical_parents),
             ("/devices/default/etherchannelinterfaces", ec_parents),
         ):
-            try:
-                response = self.session.get(
-                    f"{self.base_url}{endpoint}", params={"limit": 200}, timeout=30,
-                )
-                if response.status_code != 200:
-                    continue
-                for intf in response.json().get("items", []):
-                    if intf.get("name") == name:
-                        return True, intf
-                    if intf.get("id"):
-                        parents.append(intf["id"])
-            except requests.exceptions.RequestException as exc:
-                return False, f"Interface lookup failed: {exc}"
+            ok, items = self.get_paged_items(f"{self.base_url}{endpoint}", page_limit=200)
+            if not ok or not isinstance(items, list):
+                continue
+            for intf in items:
+                if intf.get("name") == name:
+                    return True, intf
+                if intf.get("id"):
+                    parents.append(intf["id"])
 
-        # Pass 2: subinterfaces under each parent
+        # Pass 2: subinterfaces under each parent (paginated)
         for base, parent_ids in (
             ("/devices/default/interfaces", physical_parents),
             ("/devices/default/etherchannelinterfaces", ec_parents),
         ):
             for parent_id in parent_ids:
-                try:
-                    response = self.session.get(
-                        f"{self.base_url}{base}/{parent_id}/subinterfaces",
-                        params={"limit": 200}, timeout=30,
-                    )
-                    if response.status_code != 200:
-                        continue
-                    for intf in response.json().get("items", []):
-                        if intf.get("name") == name:
-                            return True, intf
-                except requests.exceptions.RequestException:
+                ok, items = self.get_paged_items(
+                    f"{self.base_url}{base}/{parent_id}/subinterfaces", page_limit=200,
+                )
+                if not ok or not isinstance(items, list):
                     continue
+                for intf in items:
+                    if intf.get("name") == name:
+                        return True, intf
 
         return False, (
             f"Interface '{name}' not found. Use the logical name "
@@ -445,7 +416,7 @@ class FTDSNMPConfig(FTDBaseClient):
         return failed == 0 and info_ok
 
     def deploy_changes(self) -> bool:
-        """Deploy pending changes."""
+        """Deploy pending changes and poll the task until completion."""
         print(f"\n{'='*60}")
         print("Deploying configuration changes...")
         print(f"{'='*60}")
@@ -454,9 +425,11 @@ class FTDSNMPConfig(FTDBaseClient):
                 f"{self.base_url}/operational/deploy", json={}, timeout=30,
             )
             if response.status_code in (200, 201, 202):
-                print(flair("deploy", "OK", "configuration changes"))
+                print(flair("deploy", "OK", "configuration changes initiated"))
                 print("  (Deployment may take several minutes)")
-                return True
+                # Poll the deployment task until it finishes (shared poller
+                # in FTDBaseClient).
+                return self.start_and_wait_deployment(response)
             print(flair("deploy", "FAIL", "configuration changes",
                         f"HTTP {response.status_code}"))
             return False
@@ -495,6 +468,12 @@ Examples:
     parser.add_argument('--host', required=True, help='FTD management IP')
     parser.add_argument('-u', '--username', required=True, help='FDM username')
     parser.add_argument('-p', '--password', help='FDM password (prompted if omitted)')
+    parser.add_argument('--verify-ssl', action='store_true', default=False,
+                        help='Verify the FTD management SSL certificate '
+                             '(default: disabled - mgmt certs are usually self-signed)')
+    parser.add_argument('--skip-verify', action='store_true', default=False,
+                        help='(DEPRECATED, ignored) SSL verification is already '
+                             'disabled by default; use --verify-ssl to enable it')
     parser.add_argument('--nms-ip', required=True, action='append',
                         help='IP address of an SNMP manager / NMS (e.g. SolarWinds). '
                              'Repeat the flag or comma-separate for multiple managers '
@@ -594,10 +573,15 @@ Examples:
                 print(f"[ERROR] {flag} must be at most {limit} characters (FDM restriction).")
                 return 1
 
+    if args.skip_verify:
+        print("[DEPRECATED] --skip-verify is ignored: SSL verification is "
+              "already disabled by default. Use --verify-ssl to enable it.")
+
     client = FTDSNMPConfig(
         host=args.host,
         username=args.username,
         password=args.password,
+        verify_ssl=args.verify_ssl,
         debug=args.debug,
     )
 

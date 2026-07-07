@@ -89,7 +89,6 @@ class FTDAPIClient(FTDBaseClient):
         self._physical_interface_cache = {}      # Ethernet1/1 -> {id: xxx, .}
         self._etherchannel_cache = {}            # Port-channel1 -> {id: xxx, .}
         self._bridge_group_cache = {}            # BVI/BridgeGroup name -> {id: xxx, .}  (NO hardwareName)
-        self._security_zone_cache = {}           # zone_name -> {id: xxx, .}
         self._network_object_cache = {}          # object_name -> {id: xxx, .}
         self._caches_populated = False
 
@@ -97,6 +96,11 @@ class FTDAPIClient(FTDBaseClient):
         # Track individual failed items for the failure summary report
         self.failed_items: List[Dict[str, str]] = []
         self._failed_items_lock = threading.Lock()
+
+        # Phases that failed outright without producing per-item stats
+        # (e.g. a missing input file). compute_outcome treats a non-empty
+        # list as a failed run even when the item counters show no failures.
+        self.phase_failures: List[str] = []
 
         # Track statistics
         self.stats = {
@@ -159,21 +163,25 @@ class FTDAPIClient(FTDBaseClient):
                 "error": str(error)
             })
 
+    def record_phase_failure(self, label: str) -> None:
+        """Record a phase that failed outright (e.g. missing input file)."""
+        self.phase_failures.append(label)
+
     def compute_outcome(self) -> tuple:
-        """Determine overall run outcome from stats.
+        """Determine overall run outcome from stats and phase failures.
 
         Returns:
             (exit_code, outcome_label) where:
                 0, "SUCCESS"         - every item succeeded or was skipped
-                2, "PARTIAL_FAILURE" - at least one item failed but some succeeded/skipped
-                3, "ALL_FAILED"      - every attempted item failed (nothing created/updated/skipped)
+                2, "PARTIAL_FAILURE" - at least one item/phase failed but some succeeded/skipped
+                3, "ALL_FAILED"      - every attempted item/phase failed (nothing created/updated/skipped)
         """
         total_failed = sum(v for k, v in self.stats.items() if k.endswith("_failed"))
         total_ok = sum(
             v for k, v in self.stats.items()
             if k.endswith(("_created", "_updated", "_skipped"))
         )
-        if total_failed == 0:
+        if total_failed == 0 and not self.phase_failures:
             return 0, "SUCCESS"
         if total_ok > 0:
             return 2, "PARTIAL_FAILURE"
@@ -212,43 +220,8 @@ class FTDAPIClient(FTDBaseClient):
         Returns:
             (True, object_dict) if found, (False, error_message) otherwise.
         """
-        try:
-            # Try filter parameter first
-            response = self.session.get(
-                endpoint, params={"filter": f"name:{name}", "limit": 10}, timeout=30,
-            )
-            if response.status_code == 200:
-                for obj in response.json().get("items", []):
-                    if obj.get("name") == name:
-                        return True, obj
-
-            # Fallback: paginated scan. An exact name match always wins;
-            # the match predicate is only used when no name match exists.
-            fallback_obj = None
-            offset = 0
-            limit = 100
-            while True:
-                response = self.session.get(
-                    endpoint, params={"offset": offset, "limit": limit}, timeout=30,
-                )
-                if response.status_code != 200:
-                    return False, f"API error: {response.status_code}"
-                data = response.json()
-                items = data.get("items", [])
-                for obj in items:
-                    if obj.get("name") == name:
-                        return True, obj
-                    if fallback_obj is None and match is not None and match(obj):
-                        fallback_obj = obj
-                paging = data.get("paging", {})
-                if not items or offset + len(items) >= paging.get("count", len(items)):
-                    break
-                offset += limit
-            if fallback_obj is not None:
-                return True, fallback_obj
-            return False, f"Object not found: {name}"
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            return False, str(e)
+        # Shared filter-first + paginated-scan lookup lives in FTDBaseClient.
+        return self.find_object_by_name(endpoint, name, match=match)
 
     # FDM bookkeeping fields that are present on every GET response but never
     # part of the converter's create payload. Excluded from the
@@ -275,20 +248,21 @@ class FTDAPIClient(FTDBaseClient):
         """
         return self._values_match(existing, payload)
 
-    def _values_match(self, existing_val: Any, new_val: Any) -> bool:
+    @classmethod
+    def _values_match(cls, existing_val: Any, new_val: Any) -> bool:
         """Recursive comparison helper for _payload_matches_existing."""
         if isinstance(new_val, dict) and isinstance(existing_val, dict):
             for key, val in new_val.items():
-                if key in self._FDM_META_KEYS:
+                if key in cls._FDM_META_KEYS:
                     continue
-                if not self._values_match(existing_val.get(key), val):
+                if not cls._values_match(existing_val.get(key), val):
                     return False
             return True
         if isinstance(new_val, list) and isinstance(existing_val, list):
             if len(new_val) != len(existing_val):
                 return False
             return all(
-                self._values_match(e, n) for e, n in zip(existing_val, new_val)
+                cls._values_match(e, n) for e, n in zip(existing_val, new_val)
             )
         return existing_val == new_val
 
@@ -340,31 +314,58 @@ class FTDAPIClient(FTDBaseClient):
                 self.record_stat(f"{stat_prefix}_skipped")
             return True, f"SKIPPED: identical to existing '{obj_name}'"
 
-        # Merge: keep the existing id/version, apply new payload on top
-        update_payload = dict(existing)
-        update_payload.update(payload)
-        update_payload["id"] = obj_id
-        update_payload["version"] = obj_version
-        # Read-only metadata from the GET response - not valid in a PUT body
-        update_payload.pop("links", None)
-
         try:
-            put_url = f"{endpoint}/{obj_id}"
-            response = self.session.put(put_url, json=update_payload, timeout=30)
+            for attempt in range(2):
+                # Merge: keep the existing id/version, apply new payload on top
+                update_payload = dict(existing)
+                update_payload.update(payload)
+                update_payload["id"] = obj_id
+                update_payload["version"] = obj_version
+                # Read-only metadata from the GET response - not valid in a PUT body
+                update_payload.pop("links", None)
 
-            if response.status_code in (200, 201):
-                updated_obj = response.json()
+                put_url = f"{endpoint}/{obj_id}"
+                response = self.session.put(put_url, json=update_payload, timeout=30)
+
+                if response.status_code in (200, 201):
+                    updated_obj = response.json()
+                    if track_stats:
+                        self.record_stat(f"{stat_prefix}_updated")
+                    return True, f"UPDATED:{updated_obj.get('id', obj_id)}"
+
+                error_msg = self._extract_error_message(response, response.text)
+
+                # GET+PUT race: a concurrent writer may have bumped the
+                # object version between our GET and PUT. Re-GET once and
+                # retry the PUT with the fresh version.
+                if attempt == 0 and self._is_version_conflict(response.status_code, error_msg):
+                    found, fresh = self._get_object_by_name_from_endpoint(endpoint, obj_name, match=match)
+                    if found and isinstance(fresh, dict) and fresh.get("id"):
+                        existing = fresh
+                        obj_id = fresh.get("id")
+                        obj_version = fresh.get("version")
+                        continue
+
                 if track_stats:
-                    self.record_stat(f"{stat_prefix}_updated")
-                return True, f"UPDATED:{updated_obj.get('id', obj_id)}"
-            if track_stats:
-                self.record_stat(f"{stat_prefix}_failed")
-            error_msg = self._extract_error_message(response, response.text)
-            return False, f"Update failed (HTTP {response.status_code}): {error_msg}"
+                    self.record_stat(f"{stat_prefix}_failed")
+                return False, f"Update failed (HTTP {response.status_code}): {error_msg}"
+
+            # Unreachable: the loop always returns or continues at most once.
+            return False, "Update failed: version conflict retry exhausted"
         except requests.exceptions.RequestException as e:
             if track_stats:
                 self.record_stat(f"{stat_prefix}_failed")
             return False, f"Update request error: {e}"
+
+    @staticmethod
+    def _is_version_conflict(status_code: int, error_msg: str) -> bool:
+        """Return True when a failed PUT looks like an FDM version conflict."""
+        if status_code == 409:
+            return True
+        msg = (error_msg or "").lower()
+        return "version" in msg and any(
+            marker in msg for marker in ("conflict", "stale", "mismatch", "not match", "does not match", "modified")
+        )
 
     def _create_api_object(
         self,
@@ -429,6 +430,34 @@ class FTDAPIClient(FTDBaseClient):
             if track_stats:
                 self.record_stat(f"{stat_prefix}_failed")
             return False, str(e)
+
+    def _handle_422_conflict(
+        self,
+        response: requests.Response,
+        endpoint: str,
+        payload: Dict,
+        stat_prefix: str,
+        match: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        error_prefix: str = "",
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Shared 422 handling for the interface-style create methods.
+
+        A duplicate ("already exists"/"duplicate") is updated in place when
+        ``update_existing`` is enabled, otherwise skipped.  Any other 422 is
+        reported as a failure with the parsed error message.
+
+        Returns:
+            (success, message) in the same shape as the create methods.
+        """
+        error_msg = self._extract_error_message(response)
+        if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
+            if self.update_existing:
+                return self._update_existing_object(endpoint, payload, stat_prefix, match=match)
+            self.record_stat(f"{stat_prefix}_skipped")
+            return True, f"SKIPPED: {error_msg}"
+        self.record_stat(f"{stat_prefix}_failed")
+        return False, f"{error_prefix}{error_msg}"
 
     def _disable_cts_settings_for_member_prep(self, payload: Dict[str, Any]) -> int:
         """
@@ -513,51 +542,46 @@ class FTDAPIClient(FTDBaseClient):
             return
         
         print("  Prefetching interface references...")
-        
-        # Fetch all physical interfaces
+
+        # Fetch all physical interfaces (paginated)
         endpoint = f"{self.base_url}/devices/default/interfaces"
-        try:
-            response = self.session.get(endpoint, params={"limit": 200}, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                interfaces = data.get("items", [])
-                for intf in interfaces:
-                    hardware_name = intf.get('hardwareName', '')
-                    if hardware_name:
-                        self._physical_interface_cache[hardware_name] = intf
-                print(f"    Cached {len(self._physical_interface_cache)} physical interfaces")
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            print(f"    Warning: Failed to cache physical interfaces: {e}")
-        
-        # Fetch all etherchannels
+        ok, interfaces = self.get_paged_items(endpoint, page_limit=200)
+        if ok and isinstance(interfaces, list):
+            for intf in interfaces:
+                # Only keep physical interfaces in this cache (consistent
+                # with populate_physical_interface_cache)
+                if intf.get("type") != "physicalinterface":
+                    continue
+                hardware_name = intf.get('hardwareName', '')
+                if hardware_name:
+                    self._physical_interface_cache[hardware_name] = intf
+            print(f"    Cached {len(self._physical_interface_cache)} physical interfaces")
+        else:
+            print(f"    Warning: Failed to cache physical interfaces: {interfaces}")
+
+        # Fetch all etherchannels (paginated)
         endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces"
-        try:
-            response = self.session.get(endpoint, params={"limit": 100}, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                etherchannels = data.get("items", [])
-                for ec in etherchannels:
-                    hardware_name = ec.get('hardwareName', '')
-                    if hardware_name:
-                        self._etherchannel_cache[hardware_name] = ec
-                print(f"    Cached {len(self._etherchannel_cache)} etherchannels")
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            print(f"    Warning: Failed to cache etherchannels: {e}")
+        ok, etherchannels = self.get_paged_items(endpoint, page_limit=100)
+        if ok and isinstance(etherchannels, list):
+            for ec in etherchannels:
+                hardware_name = ec.get('hardwareName', '')
+                if hardware_name:
+                    self._etherchannel_cache[hardware_name] = ec
+            print(f"    Cached {len(self._etherchannel_cache)} etherchannels")
+        else:
+            print(f"    Warning: Failed to cache etherchannels: {etherchannels}")
 
         # Fetch all bridge-group interfaces (these often do NOT have hardwareName)
         endpoint = f"{self.base_url}/devices/default/bridgegroupinterfaces"
-        try:
-            response = self.session.get(endpoint, params={"limit": 200}, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                bgs = data.get("items", [])
-                for bg in bgs:
-                    bg_name = (bg.get("name") or "").strip()
-                    if bg_name:
-                        self._bridge_group_cache[bg_name] = bg
-                print(f"    Cached {len(self._bridge_group_cache)} bridge groups")
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            print(f"    Warning: Failed to cache bridge groups: {e}")
+        ok, bgs = self.get_paged_items(endpoint, page_limit=200)
+        if ok and isinstance(bgs, list):
+            for bg in bgs:
+                bg_name = (bg.get("name") or "").strip()
+                if bg_name:
+                    self._bridge_group_cache[bg_name] = bg
+            print(f"    Cached {len(self._bridge_group_cache)} bridge groups")
+        else:
+            print(f"    Warning: Failed to cache bridge groups: {bgs}")
 
         self._caches_populated = True
 
@@ -575,50 +599,20 @@ class FTDAPIClient(FTDBaseClient):
             return
         
         print("  Prefetching network object references...")
-        
+
         endpoint = f"{self.base_url}/object/networks"
-        offset = 0
-        limit = 200  # Fetch 200 at a time
-        total_fetched = 0
-        
-        try:
-            while True:
-                params = {
-                    "offset": offset,
-                    "limit": limit
-                }
-                response = self.session.get(endpoint, params=params, timeout=60)
-                
-                if response.status_code != 200:
-                    print(f"    Warning: Failed to fetch network objects (HTTP {response.status_code})")
-                    break
-                
-                data = response.json()
-                items = data.get("items", [])
-                
-                # Cache each object by name
-                for obj in items:
-                    obj_name = obj.get('name', '')
-                    if obj_name:
-                        self._network_object_cache[obj_name] = obj
-                
-                total_fetched += len(items)
-                
-                # Check if there are more pages
-                paging = data.get('paging', {})
-                total_count = paging.get('count', total_fetched)
-                
-                # If we've fetched all items or this page was empty, stop
-                if len(items) == 0 or total_fetched >= total_count:
-                    break
-                
-                # Move to next page
-                offset += limit
-            
-            print(f"    Cached {len(self._network_object_cache)} network objects")
-            
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            print(f"    Warning: Failed to cache network objects: {e}")
+        ok, items = self.get_paged_items(endpoint, page_limit=200, timeout=60)
+        if not ok or not isinstance(items, list):
+            print(f"    Warning: Failed to cache network objects: {items}")
+            return
+
+        # Cache each object by name
+        for obj in items:
+            obj_name = obj.get('name', '')
+            if obj_name:
+                self._network_object_cache[obj_name] = obj
+
+        print(f"    Cached {len(self._network_object_cache)} network objects")
     
     def get_cached_physical_interface(self, hardware_name: str) -> Tuple[bool, Union[Dict[str, Any], str, None]]:
         """
@@ -676,48 +670,27 @@ class FTDAPIClient(FTDBaseClient):
 
         self._physical_interface_cache.clear()
 
-        offset = 0
-        limit = 200  # higher limit = fewer round-trips; safe for typical interface counts
+        ok, items = self.get_paged_items(endpoint, page_limit=200)
+        if not ok or not isinstance(items, list):
+            print(f"[WARN] Could not fetch interfaces list: {items}")
+            return
 
-        try:
-            while True:
-                params = {"offset": offset, "limit": limit}
-                response = self.session.get(endpoint, params=params, timeout=30)
+        for intf in items:
+            # Only keep physical interfaces in this cache
+            if intf.get("type") != "physicalinterface":
+                continue
 
-                if response.status_code != 200:
-                    print(f"[WARN] Could not fetch interfaces list: {response.status_code}")
-                    print(f"       {self._extract_error_message(response)}")
-                    return
+            hw = intf.get("hardwareName")
+            if hw:
+                self._physical_interface_cache[hw] = intf
 
-                data = response.json()
-                items = data.get("items", [])
-                if not items:
-                    break
+        print(f"    Cached {len(self._physical_interface_cache)} existing physical interfaces")
 
-                for intf in items:
-                    # Only keep physical interfaces in this cache
-                    if intf.get("type") != "physicalinterface":
-                        continue
-
-                    hw = intf.get("hardwareName")
-                    if hw:
-                        self._physical_interface_cache[hw] = intf
-
-                paging = data.get("paging", {})
-                if not paging.get("next"):
-                    break
-
-                offset += limit
-
-            print(f"    Cached {len(self._physical_interface_cache)} existing physical interfaces")
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            print(f"[WARN] Exception while fetching physical interfaces: {e}")
-    
     def clear_caches(self) -> None:
         """Clear all reference caches."""
         self._physical_interface_cache.clear()
         self._etherchannel_cache.clear()
-        self._security_zone_cache.clear()
+        self._bridge_group_cache.clear()
         self._network_object_cache.clear()
         self._caches_populated = False
 
@@ -983,51 +956,23 @@ class FTDAPIClient(FTDBaseClient):
             Tuple of (success: bool, interface dict or error message)
         """
         endpoint = f"{self.base_url}/devices/default/interfaces"
-        
+
         # Normalize the hardware name for comparison (case-insensitive)
         search_name = hardware_name.lower().strip()
-        
-        try:
-            # Use pagination to get all interfaces
-            all_interfaces: List[Dict[str, Any]] = []
-            offset = 0
-            limit = 100
-            
-            while True:
-                params = {"offset": offset, "limit": limit}
-                response = self.session.get(endpoint, params=params, timeout=30)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    interfaces = data.get('items', [])
-                    
-                    if not interfaces:
-                        break
-                    
-                    all_interfaces.extend(interfaces)
-                    
-                    # Check pagination
-                    paging = data.get('paging', {})
-                    if not paging.get('next'):
-                        break
-                    
-                    offset += limit
-                else:
-                    return False, f"HTTP {response.status_code}: {self._extract_error_message(response)}"
 
-            # Search for the interface (case-insensitive)
-            for intf in all_interfaces:
-                intf_hardware = intf.get('hardwareName', '').lower().strip()
-                if intf_hardware == search_name:
-                    return True, intf
-            
-            # Interface not found - this might be because it's disabled/unconfigured
-            return False, f"Interface {hardware_name} not found (may be disabled or not present on this device)"
-                
-        except (ValueError, TypeError, KeyError) as e:
-            return False, f"Invalid interface response payload: {e}"
-        except requests.exceptions.RequestException as e:
-            return False, str(e)
+        # Use the shared pagination helper to get all interfaces
+        ok, all_interfaces = self.get_paged_items(endpoint)
+        if not ok or not isinstance(all_interfaces, list):
+            return False, str(all_interfaces)
+
+        # Search for the interface (case-insensitive)
+        for intf in all_interfaces:
+            intf_hardware = intf.get('hardwareName', '').lower().strip()
+            if intf_hardware == search_name:
+                return True, intf
+
+        # Interface not found - this might be because it's disabled/unconfigured
+        return False, f"Interface {hardware_name} not found (may be disabled or not present on this device)"
         
     def get_interface_by_hardware_name(self, hardware_name: str) -> Tuple[bool, Union[Dict[str, Any], str]]:
         """
@@ -1049,83 +994,60 @@ class FTDAPIClient(FTDBaseClient):
         
         # Check if this looks like a subinterface (contains a dot like "Port-channel1.108")
         is_subinterface = '.' in hardware_name
-        
-        # Try all physical interfaces endpoint first
+
+        # Try all physical interfaces endpoint first (paginated)
         endpoint = f"{self.base_url}/devices/default/interfaces"
-        items: List[Dict] = []
-        
-        try:
-            response = self.session.get(endpoint, params={"limit": 200}, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                
-                for intf in items:
-                    if intf.get('hardwareName') == hardware_name:
-                        # Cache it for future lookups
-                        self._physical_interface_cache[hardware_name] = intf
-                        return True, intf
-            
-            # If it's a subinterface, search subinterfaces under physical interfaces
-            if is_subinterface:
-                # Extract parent hardware name (e.g., "Port-channel1" from "Port-channel1.108")
-                parent_hw_name = hardware_name.split('.')[0]
-                
-                # First check if parent is an etherchannel
-                ec_endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces"
-                response = self.session.get(ec_endpoint, params={"limit": 100}, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    etherchannels = data.get('items', [])
-                    
-                    for ec in etherchannels:
-                        if ec.get('hardwareName') == parent_hw_name:
-                            # Found parent etherchannel, now get its subinterfaces
-                            parent_id = ec.get('id')
-                            sub_endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces/{parent_id}/subinterfaces"
-                            sub_response = self.session.get(sub_endpoint, params={"limit": 100}, timeout=30)
-                            
-                            if sub_response.status_code == 200:
-                                sub_data = sub_response.json()
-                                subinterfaces = sub_data.get('items', [])
-                                
-                                for sub in subinterfaces:
-                                    if sub.get('hardwareName') == hardware_name:
-                                        return True, sub
-                
-                # Check if parent is a physical interface
-                for intf in items:
-                    if intf.get('hardwareName') == parent_hw_name:
-                        # Found parent physical interface, now get its subinterfaces
-                        parent_id = intf.get('id')
-                        sub_endpoint = f"{self.base_url}/devices/default/interfaces/{parent_id}/subinterfaces"
-                        sub_response = self.session.get(sub_endpoint, params={"limit": 100}, timeout=30)
-                        
-                        if sub_response.status_code == 200:
-                            sub_data = sub_response.json()
-                            subinterfaces = sub_data.get('items', [])
-                            
-                            for sub in subinterfaces:
-                                if sub.get('hardwareName') == hardware_name:
-                                    return True, sub
-            
-            # Also try etherchannels endpoint
-            ec_endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces"
-            response = self.session.get(ec_endpoint, params={"limit": 100}, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                
-                for intf in items:
-                    if intf.get('hardwareName') == hardware_name:
-                        self._etherchannel_cache[hardware_name] = intf
-                        return True, intf
-            
-            return False, f"Interface not found: {hardware_name}"
-        except (ValueError, TypeError, KeyError) as e:
-            return False, f"Invalid interface response payload: {e}"
-        except requests.exceptions.RequestException as e:
-            return False, str(e)
+        ok, fetched = self.get_paged_items(endpoint, page_limit=200)
+        items: List[Dict] = fetched if ok and isinstance(fetched, list) else []
+
+        for intf in items:
+            if intf.get('hardwareName') == hardware_name:
+                # Cache it for future lookups
+                self._physical_interface_cache[hardware_name] = intf
+                return True, intf
+
+        # Fetch all etherchannels once (paginated); used for both the
+        # subinterface parent search and the direct etherchannel match.
+        ec_endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces"
+        ok, fetched = self.get_paged_items(ec_endpoint, page_limit=100)
+        etherchannels: List[Dict] = fetched if ok and isinstance(fetched, list) else []
+
+        # If it's a subinterface, search subinterfaces under physical interfaces
+        if is_subinterface:
+            # Extract parent hardware name (e.g., "Port-channel1" from "Port-channel1.108")
+            parent_hw_name = hardware_name.split('.')[0]
+
+            # First check if parent is an etherchannel
+            for ec in etherchannels:
+                if ec.get('hardwareName') == parent_hw_name:
+                    # Found parent etherchannel, now get its subinterfaces
+                    parent_id = ec.get('id')
+                    sub_endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces/{parent_id}/subinterfaces"
+                    ok, subinterfaces = self.get_paged_items(sub_endpoint, page_limit=100)
+                    if ok and isinstance(subinterfaces, list):
+                        for sub in subinterfaces:
+                            if sub.get('hardwareName') == hardware_name:
+                                return True, sub
+
+            # Check if parent is a physical interface
+            for intf in items:
+                if intf.get('hardwareName') == parent_hw_name:
+                    # Found parent physical interface, now get its subinterfaces
+                    parent_id = intf.get('id')
+                    sub_endpoint = f"{self.base_url}/devices/default/interfaces/{parent_id}/subinterfaces"
+                    ok, subinterfaces = self.get_paged_items(sub_endpoint, page_limit=100)
+                    if ok and isinstance(subinterfaces, list):
+                        for sub in subinterfaces:
+                            if sub.get('hardwareName') == hardware_name:
+                                return True, sub
+
+        # Also try a direct etherchannel match
+        for intf in etherchannels:
+            if intf.get('hardwareName') == hardware_name:
+                self._etherchannel_cache[hardware_name] = intf
+                return True, intf
+
+        return False, f"Interface not found: {hardware_name}"
     
     def _apply_model_specific_media_defaults(self, existing_intf: Dict, update_payload: Dict,) -> None:
         """
@@ -1203,19 +1125,19 @@ class FTDAPIClient(FTDBaseClient):
         
         # First, get the existing interface to retrieve its ID and version
         if not isinstance(hardware_name, str) or not hardware_name.strip():
-            self.stats["physical_interfaces_failed"] += 1
+            self.record_stat("physical_interfaces_failed")
             return False, "Missing or invalid hardwareName"
 
         success, existing = self.get_physical_interface(hardware_name)
         if not success or not isinstance(existing, dict):
             # Interface not found - skip it instead of failing
-            self.stats["physical_interfaces_skipped"] += 1
+            self.record_stat("physical_interfaces_skipped")
             return True, f"SKIPPED: {existing}"
         
         # Merge our updates with the existing interface
         intf_id = existing.get('id')
         if not intf_id:
-            self.stats["physical_interfaces_failed"] += 1
+            self.record_stat("physical_interfaces_failed")
             return False, f"Resolved interface {hardware_name} has no ID"
         
         # Check if interface is in switchport mode
@@ -1235,7 +1157,7 @@ class FTDAPIClient(FTDBaseClient):
             
             convert_success, convert_msg = self._convert_switchport_to_routed(existing)
             if not convert_success:
-                self.stats["physical_interfaces_failed"] += 1
+                self.record_stat("physical_interfaces_failed")
                 if self.debug:
                     print(f"\n      [DEBUG] Conversion failure details: {convert_msg}")
                 return False, f"Failed to convert from switchport: {convert_msg}"
@@ -1245,12 +1167,12 @@ class FTDAPIClient(FTDBaseClient):
             # Re-fetch the interface after mode change to get updated version
             success, existing = self.get_physical_interface(hardware_name)
             if not success or not isinstance(existing, dict):
-                self.stats["physical_interfaces_failed"] += 1
+                self.record_stat("physical_interfaces_failed")
                 return False, f"Failed to re-fetch interface after mode change: {existing}"
             
             intf_id = existing.get('id')
             if not intf_id:
-                self.stats["physical_interfaces_failed"] += 1
+                self.record_stat("physical_interfaces_failed")
                 return False, f"Interface {hardware_name} has no ID after mode conversion"
         
         # Start with the existing interface configuration
@@ -1367,22 +1289,22 @@ class FTDAPIClient(FTDBaseClient):
             
             if response.status_code in [200, 201]:
                 updated_obj = response.json()
-                self.stats["physical_interfaces_updated"] += 1
+                self.record_stat("physical_interfaces_updated")
                 return True, updated_obj.get("id")
             elif response.status_code == 422:
                 error_msg = self._extract_error_message(response)
-                self.stats["physical_interfaces_failed"] += 1
+                self.record_stat("physical_interfaces_failed")
                 return False, error_msg
             else:
-                self.stats["physical_interfaces_failed"] += 1
-                error_msg = response.text
+                self.record_stat("physical_interfaces_failed")
+                error_msg = f"HTTP {response.status_code}: {self._extract_error_message(response)}"
                 return False, error_msg
                 
         except (ValueError, TypeError, KeyError) as e:
-            self.stats["physical_interfaces_failed"] += 1
+            self.record_stat("physical_interfaces_failed")
             return False, f"Invalid interface update response payload: {e}"
         except requests.exceptions.RequestException as e:
-            self.stats["physical_interfaces_failed"] += 1
+            self.record_stat("physical_interfaces_failed")
             return False, str(e)
     
     def _convert_switchport_to_routed(self, intf: Dict) -> Tuple[bool, str]:
@@ -1468,7 +1390,7 @@ class FTDAPIClient(FTDBaseClient):
         hardware_name = intf.get('hardwareName', '')
         
         if '.' not in hardware_name:
-            self.stats["subinterfaces_failed"] += 1
+            self.record_stat("subinterfaces_failed")
             return False, f"Invalid hardwareName format: {hardware_name} (expected parent.vlanid)"
         
         parent_hardware, vlan_str = hardware_name.rsplit('.', 1)
@@ -1476,7 +1398,7 @@ class FTDAPIClient(FTDBaseClient):
         try:
             vlan_id = int(vlan_str)
         except ValueError:
-            self.stats["subinterfaces_failed"] += 1
+            self.record_stat("subinterfaces_failed")
             return False, f"Invalid VLAN ID: {vlan_str}"
         
         # We need to find the parent interface ID
@@ -1503,13 +1425,13 @@ class FTDAPIClient(FTDBaseClient):
         
         if not success:
             # Parent interface not found - skip
-            self.stats["subinterfaces_skipped"] += 1
+            self.record_stat("subinterfaces_skipped")
             if self.debug:
                 print("              Skipping subinterface creation (parent not available)")
             return True, f"SKIPPED: Parent interface {parent_hardware} not found"
 
         if not isinstance(parent_intf, dict):
-            self.stats["subinterfaces_failed"] += 1
+            self.record_stat("subinterfaces_failed")
             return False, f"Resolved parent interface is invalid: {parent_intf}"
         
         if self.debug:
@@ -1517,7 +1439,7 @@ class FTDAPIClient(FTDBaseClient):
         
         parent_id = parent_intf.get('id')
         if not parent_id:
-            self.stats["subinterfaces_failed"] += 1
+            self.record_stat("subinterfaces_failed")
             return False, f"Parent interface {parent_hardware} has no ID"
 
         parent_type = parent_intf.get('type', 'physicalinterface')
@@ -1600,41 +1522,23 @@ class FTDAPIClient(FTDBaseClient):
             
             if response.status_code in [200, 201]:
                 created_obj = response.json()
-                self.stats["subinterfaces_created"] += 1
+                self.record_stat("subinterfaces_created")
                 return True, created_obj.get("id")
             elif response.status_code == 422:
-                try:
-                    error_data = response.json()
-                    error_messages = error_data.get('error', {}).get('messages', [])
-                    if error_messages:
-                        error_msg = error_messages[0].get('description', '')
-                    else:
-                        error_msg = str(error_data)
-                    
-                    if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
-                        if self.update_existing:
-                            # The duplicate may be keyed on the VLAN ID under
-                            # this parent rather than the logical name. The
-                            # endpoint is already parent-scoped, so matching
-                            # on vlanId/subIntfId is safe.
-                            return self._update_existing_object(
-                                endpoint, subintf_payload, "subinterfaces",
-                                match=(lambda o: o.get('vlanId') == vlan_id or o.get('subIntfId') == vlan_id),
-                            )
-                        self.stats["subinterfaces_skipped"] += 1
-                        return True, f"SKIPPED: {error_msg}"
-
-                    self.stats["subinterfaces_failed"] += 1
-                    return False, f"422: {error_msg}"
-                except (ValueError, TypeError, KeyError):
-                    self.stats["subinterfaces_failed"] += 1
-                    return False, f"422: {self._extract_error_message(response)}"
+                # The duplicate may be keyed on the VLAN ID under this parent
+                # rather than the logical name. The endpoint is already
+                # parent-scoped, so matching on vlanId/subIntfId is safe.
+                return self._handle_422_conflict(
+                    response, endpoint, subintf_payload, "subinterfaces",
+                    match=(lambda o: o.get('vlanId') == vlan_id or o.get('subIntfId') == vlan_id),
+                    error_prefix="422: ",
+                )
             else:
-                self.stats["subinterfaces_failed"] += 1
+                self.record_stat("subinterfaces_failed")
                 return False, f"HTTP {response.status_code}: {self._extract_error_message(response)}"
                 
         except requests.exceptions.RequestException as e:
-            self.stats["subinterfaces_failed"] += 1
+            self.record_stat("subinterfaces_failed")
             return False, str(e)
     
     def _get_etherchannel_by_hardware(self, hardware_name: str) -> Tuple[bool, Union[Dict[str, Any], str]]:
@@ -1649,25 +1553,17 @@ class FTDAPIClient(FTDBaseClient):
         """
         endpoint = f"{self.base_url}/devices/default/etherchannelinterfaces"
         search_name = hardware_name.lower().strip()
-        
-        try:
-            response = self.session.get(endpoint, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                interfaces = data.get('items', [])
-                
-                for intf in interfaces:
-                    intf_hardware = intf.get('hardwareName', '').lower().strip()
-                    if intf_hardware == search_name:
-                        return True, intf
-                
-                return False, f"EtherChannel {hardware_name} not found"
-            else:
-                return False, f"HTTP {response.status_code}"
-                
-        except requests.exceptions.RequestException as e:
-            return False, str(e)
+
+        ok, interfaces = self.get_paged_items(endpoint)
+        if not ok or not isinstance(interfaces, list):
+            return False, str(interfaces)
+
+        for intf in interfaces:
+            intf_hardware = intf.get('hardwareName', '').lower().strip()
+            if intf_hardware == search_name:
+                return True, intf
+
+        return False, f"EtherChannel {hardware_name} not found"
     
     def create_etherchannel(self, intf: Dict) -> Tuple[bool, Optional[str]]:
         """
@@ -1691,8 +1587,9 @@ class FTDAPIClient(FTDBaseClient):
         member_speed_type = None
         is_sfp_member = False
         if 'memberInterfaces' in intf:
+            requested_members = intf['memberInterfaces']
             resolved_members = []
-            for member in intf['memberInterfaces']:
+            for member in requested_members:
                 hardware_name = member.get('hardwareName')
                 success, existing = self.get_physical_interface(hardware_name)
                 if success and isinstance(existing, dict):
@@ -1708,6 +1605,13 @@ class FTDAPIClient(FTDBaseClient):
                 else:
                     print(f"    Warning: Could not resolve member {hardware_name}")
             intf['memberInterfaces'] = resolved_members
+
+            # Fail outright when members were requested but NONE resolved -
+            # creating an empty etherchannel would silently drop the intent.
+            # (Warn-and-continue only when at least some members resolved.)
+            if requested_members and not resolved_members:
+                self.record_stat("etherchannels_failed")
+                return False, "No valid member interfaces found (all members failed to resolve)"
         
         # Get appliance model for platform-specific behavior
         model = str(getattr(self, "appliance_model", "generic")).lower().strip()
@@ -1756,36 +1660,27 @@ class FTDAPIClient(FTDBaseClient):
 
             if response.status_code in [200, 201]:
                 created_obj = response.json()
-                self.stats["etherchannels_created"] += 1
+                self.record_stat("etherchannels_created")
                 return True, created_obj.get("id")
             elif response.status_code == 422:
-                error_msg = self._extract_error_message(response)
-                
-                if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
-                    if self.update_existing:
-                        # The duplicate may be keyed on the Port-channel ID
-                        # rather than the logical name, so also match on
-                        # hardwareName (e.g. "Port-channel1").
-                        ec_hw = str(intf.get('hardwareName', '')).lower().strip()
-                        return self._update_existing_object(
-                            endpoint, intf, "etherchannels",
-                            match=(lambda o: bool(ec_hw) and str(o.get('hardwareName', '')).lower().strip() == ec_hw),
-                        )
-                    self.stats["etherchannels_skipped"] += 1
-                    return True, f"SKIPPED: {error_msg}"
-                else:
-                    self.stats["etherchannels_failed"] += 1
-                    return False, error_msg
+                # The duplicate may be keyed on the Port-channel ID rather
+                # than the logical name, so also match on hardwareName
+                # (e.g. "Port-channel1").
+                ec_hw = str(intf.get('hardwareName', '')).lower().strip()
+                return self._handle_422_conflict(
+                    response, endpoint, intf, "etherchannels",
+                    match=(lambda o: bool(ec_hw) and str(o.get('hardwareName', '')).lower().strip() == ec_hw),
+                )
             else:
-                self.stats["etherchannels_failed"] += 1
-                error_msg = response.text
+                self.record_stat("etherchannels_failed")
+                error_msg = f"HTTP {response.status_code}: {self._extract_error_message(response)}"
                 return False, error_msg
 
         except (ValueError, TypeError, KeyError) as e:
-            self.stats["etherchannels_failed"] += 1
+            self.record_stat("etherchannels_failed")
             return False, f"Invalid etherchannel response payload: {e}"
         except requests.exceptions.RequestException as e:
-            self.stats["etherchannels_failed"] += 1
+            self.record_stat("etherchannels_failed")
             return False, str(e)
 
     def create_bridge_group(self, intf: Dict) -> Tuple[bool, Optional[str]]:
@@ -1841,7 +1736,7 @@ class FTDAPIClient(FTDBaseClient):
             intf['selectedInterfaces'] = resolved_members
             
             if not resolved_members:
-                self.stats["bridge_groups_failed"] += 1
+                self.record_stat("bridge_groups_failed")
                 return False, "No valid member interfaces found (all members failed to resolve)"
         
         if self.debug:
@@ -1854,31 +1749,22 @@ class FTDAPIClient(FTDBaseClient):
             
             if response.status_code in [200, 201]:
                 created_obj = response.json()
-                self.stats["bridge_groups_created"] += 1
+                self.record_stat("bridge_groups_created")
                 return True, created_obj.get("id")
             elif response.status_code == 422:
-                error_msg = self._extract_error_message(response)
-                
-                if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
-                    if self.update_existing:
-                        return self._update_existing_object(
-                            endpoint, intf, "bridge_groups",
-                        )
-                    self.stats["bridge_groups_skipped"] += 1
-                    return True, f"SKIPPED: {error_msg}"
-                else:
-                    self.stats["bridge_groups_failed"] += 1
-                    return False, error_msg
+                return self._handle_422_conflict(
+                    response, endpoint, intf, "bridge_groups",
+                )
             else:
-                self.stats["bridge_groups_failed"] += 1
-                error_msg = response.text
+                self.record_stat("bridge_groups_failed")
+                error_msg = f"HTTP {response.status_code}: {self._extract_error_message(response)}"
                 return False, error_msg
                 
         except (ValueError, TypeError, KeyError) as e:
-            self.stats["bridge_groups_failed"] += 1
+            self.record_stat("bridge_groups_failed")
             return False, f"Invalid bridge-group response payload: {e}"
         except requests.exceptions.RequestException as e:
-            self.stats["bridge_groups_failed"] += 1
+            self.record_stat("bridge_groups_failed")
             return False, str(e)
         
     def create_security_zone(self, zone: Dict) -> Tuple[bool, Optional[str]]:
@@ -1938,31 +1824,22 @@ class FTDAPIClient(FTDBaseClient):
             
             if response.status_code in [200, 201]:
                 created_obj = response.json()
-                self.stats["security_zones_created"] += 1
+                self.record_stat("security_zones_created")
                 return True, created_obj.get("id")
             elif response.status_code == 422:
-                error_msg = self._extract_error_message(response)
-                
-                if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
-                    if self.update_existing:
-                        return self._update_existing_object(
-                            endpoint, zone_payload, "security_zones",
-                        )
-                    self.stats["security_zones_skipped"] += 1
-                    return True, f"SKIPPED: {error_msg}"
-                else:
-                    self.stats["security_zones_failed"] += 1
-                    return False, error_msg
+                return self._handle_422_conflict(
+                    response, endpoint, zone_payload, "security_zones",
+                )
             else:
-                self.stats["security_zones_failed"] += 1
-                error_msg = response.text
+                self.record_stat("security_zones_failed")
+                error_msg = f"HTTP {response.status_code}: {self._extract_error_message(response)}"
                 return False, error_msg
 
         except (ValueError, TypeError, KeyError) as e:
-            self.stats["security_zones_failed"] += 1
+            self.record_stat("security_zones_failed")
             return False, f"Invalid security-zone response payload: {e}"
         except requests.exceptions.RequestException as e:
-            self.stats["security_zones_failed"] += 1
+            self.record_stat("security_zones_failed")
             return False, str(e)
 
     def get_network_object_by_name(self, name: str) -> Tuple[bool, Union[Dict[str, Any], str]]:
@@ -1982,97 +1859,48 @@ class FTDAPIClient(FTDBaseClient):
         # Check cache first (fastest path)
         if name in self._network_object_cache:
             return True, self._network_object_cache[name]
-        
+
         endpoint = f"{self.base_url}/object/networks"
-        
-        try:
-            # First, try using the filter parameter for efficient lookup
-            # FTD API supports filter=name:ObjectName syntax
-            filter_params = {
-                "filter": f"name:{name}",
-                "limit": 10
-            }
-            response = self.session.get(endpoint, params=filter_params, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                
-                for obj in items:
-                    if obj.get('name') == name:
-                        # Cache for future lookups
-                        self._network_object_cache[name] = obj
-                        return True, obj
-            
-            # If filter didn't work or didn't find it, do a paginated search
-            # This handles cases where the filter syntax isn't supported
-            offset = 0
-            limit = 100  # Fetch 100 at a time for efficiency
-            
-            while True:
-                params = {
-                    "offset": offset,
-                    "limit": limit
-                }
-                response = self.session.get(endpoint, params=params, timeout=30)
-                
-                if response.status_code != 200:
-                    return False, f"API error: {response.status_code}"
-                
-                data = response.json()
-                items = data.get('items', [])
-                
-                # Search through this page of results
-                for obj in items:
-                    if obj.get('name') == name:
-                        # Cache for future lookups
-                        self._network_object_cache[name] = obj
-                        return True, obj
-                
-                # Check if there are more pages
-                paging = data.get('paging', {})
-                total_count = paging.get('count', len(items))
-                
-                # If we've fetched all items or this page was empty, stop
-                if len(items) == 0 or offset + len(items) >= total_count:
-                    break
-                
-                # Move to next page
-                offset += limit
-            
-            return False, f"Network object not found: {name}"
-            
-        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
-            return False, str(e)
+
+        # Shared filter-first + paginated-scan lookup lives in FTDBaseClient.
+        found, result = self.find_object_by_name(endpoint, name)
+        if found and isinstance(result, dict):
+            # Cache for future lookups
+            self._network_object_cache[name] = result
+            return True, result
+        return False, str(result)
     
     def deploy_changes(self) -> bool:
         """
         Deploy pending configuration changes to the FTD device.
         
         After creating/modifying objects, changes must be deployed
-        for them to take effect on the firewall.
-        
+        for them to take effect on the firewall.  The returned deployment
+        task is polled until it reaches a terminal state.
+
         Returns:
-            True if deployment initiated successfully, False otherwise
+            True if deployment completed successfully, False otherwise
         """
         print(f"\n{'='*60}")
         print("Deploying configuration changes...")
         print(f"{'='*60}")
-        
+
         endpoint = f"{self.base_url}/operational/deploy"
-        
+
         try:
             response = self.session.post(endpoint, json={}, timeout=30)
-            
+
             if response.status_code in [200, 201, 202]:
                 print("  Deployment initiated successfully")
                 print("  Note: Deployment may take several minutes to complete")
-                print("  Check FDM web interface for deployment status")
-                return True
+                # Poll the deployment task until it finishes (shared poller
+                # in FTDBaseClient).
+                return self.start_and_wait_deployment(response)
             else:
                 print(f"FAIL Deployment failed: {response.status_code}")
                 print(f"  Response: {self._extract_error_message(response)}")
                 return False
-                
+
         except requests.exceptions.RequestException as e:
             print(f"FAIL Deployment error: {e}")
             return False
@@ -2300,7 +2128,10 @@ def physical_interface_matches_json_config(current: Dict, desired_json: Dict) ->
             if des_block == {}:
                 des_block = None
 
-            if cur_block != des_block:
+            # Reuse the recursive _values_match comparison so FDM
+            # bookkeeping fields (version, id, ...) inside the block from a
+            # GET don't force a re-PUT of an otherwise unchanged interface.
+            if not FTDAPIClient._values_match(cur_block, des_block):
                 return False
 
     return True
@@ -2449,7 +2280,9 @@ def import_address_groups(client: FTDAPIClient, filename: str, delay: float = 0.
 
         success, result = client.create_network_group(cleaned_group)
         if success:
-            if isinstance(result, str) and str(result).startswith("UPDATED"):
+            if isinstance(result, str) and str(result).startswith("SKIPPED"):
+                print("[SKIP]")
+            elif isinstance(result, str) and str(result).startswith("UPDATED"):
                 print("[UPDATED]")
             else:
                 print("[OK]")
@@ -2604,7 +2437,9 @@ def import_service_groups(client: FTDAPIClient, filename: str, delay: float = 0.
 
         success, result = client.create_port_group(cleaned_group)
         if success:
-            if isinstance(result, str) and str(result).startswith("UPDATED"):
+            if isinstance(result, str) and str(result).startswith("SKIPPED"):
+                print("[SKIP]")
+            elif isinstance(result, str) and str(result).startswith("UPDATED"):
                 print("[UPDATED]")
             else:
                 print("[OK]")
@@ -2670,7 +2505,7 @@ def import_physical_interfaces(client: FTDAPIClient, filename: str, delay: float
         if not hardware or hardware not in client._physical_interface_cache:
             print("[SKIP] (not present on this FTD model)")
             skipped_count += 1
-            client.stats["physical_interfaces_skipped"] += 1
+            client.record_stat("physical_interfaces_skipped")
             continue
 
         # Get the original interface from cache
@@ -2685,7 +2520,7 @@ def import_physical_interfaces(client: FTDAPIClient, filename: str, delay: float
         if physical_interface_matches_json_config(original, intf) and not member_has_cts_enabled:
             print("[OK] No changes needed.")
             skipped_count += 1
-            client.stats["physical_interfaces_skipped"] += 1
+            client.record_stat("physical_interfaces_skipped")
             continue
 
         if member_has_cts_enabled:
@@ -3112,8 +2947,12 @@ Examples:
                        help='Base name of converted JSON files (default: ftd_config)')
     parser.add_argument('--deploy', action='store_true',
                        help='Automatically deploy changes after import')
-    parser.add_argument('--skip-verify', action='store_true', default=True,
-                       help='Skip SSL certificate verification (default: True)')
+    parser.add_argument('--verify-ssl', action='store_true', default=False,
+                       help='Verify the FTD management SSL certificate '
+                            '(default: disabled - mgmt certs are usually self-signed)')
+    parser.add_argument('--skip-verify', action='store_true', default=False,
+                       help='(DEPRECATED, ignored) SSL verification is already '
+                            'disabled by default; use --verify-ssl to enable it')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output (shows API payloads)')
     parser.add_argument("--metadata-file", default="",
@@ -3182,13 +3021,17 @@ Examples:
     # Prompt for password if not provided
     if not args.password:
         args.password = getpass.getpass(f"Enter password for {args.username}: ")
-    
+
+    if args.skip_verify:
+        print("[DEPRECATED] --skip-verify is ignored: SSL verification is "
+              "already disabled by default. Use --verify-ssl to enable it.")
+
     # Create API client
     client = FTDAPIClient(
         host=args.host,
         username=args.username,
         password=args.password,
-        verify_ssl=not args.skip_verify,
+        verify_ssl=args.verify_ssl,
         update_existing=not args.skip_existing,
     )
 
@@ -3215,7 +3058,16 @@ Examples:
             if k.endswith("_failed")
         )
 
-        if phase_failed == 0:
+        # A phase that returned False without recording any per-item
+        # failures failed outright (e.g. missing input file). Track it so
+        # compute_outcome does not report SUCCESS.
+        phase_hard_failed = result is False and phase_failed == 0
+        if phase_hard_failed:
+            client.record_phase_failure(label)
+
+        if phase_hard_failed:
+            status = "FAIL"
+        elif phase_failed == 0:
             status = "OK"
         elif phase_ok > 0:
             status = "PARTIAL"
@@ -3224,7 +3076,7 @@ Examples:
 
         phase_timings.append({
             "label": label, "seconds": duration,
-            "success": phase_failed == 0, "status": status,
+            "success": phase_failed == 0 and not phase_hard_failed, "status": status,
             "ok_count": phase_ok, "failed_count": phase_failed,
         })
         return result
@@ -3457,8 +3309,9 @@ Examples:
             print(f"[FAIL] Could not write failed imports report: {failed_report_path}")
 
     # Deploy changes if requested
+    deploy_ok = True
     if args.deploy:
-        client.deploy_changes()
+        deploy_ok = client.deploy_changes()
     else:
         print(f"\n{'='*60}")
         print("Import complete. Changes are pending deployment.")
@@ -3468,6 +3321,11 @@ Examples:
         print(f"{'='*60}")
 
     exit_code, outcome = client.compute_outcome()
+
+    # A failed deployment must be reflected in the exit code even when
+    # every individual import succeeded.
+    if args.deploy and not deploy_ok and exit_code == 0:
+        exit_code, outcome = 2, "DEPLOY_FAILED"
 
     if args.json_report:
         report_payload = {
@@ -3490,6 +3348,7 @@ Examples:
             "deploy_requested": args.deploy,
             "target_model": target_model,
             "stats": client.stats,
+            "phase_failures": client.phase_failures,
             "phase_timings": phase_timings,
             "total_seconds": total_seconds,
             "exit_code": exit_code,

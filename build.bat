@@ -21,22 +21,28 @@ echo ============================================================
 echo.
 
 REM ---------- Resolve version ----------
+REM Always read the current version from gui_app.py first, so a command-line
+REM override can be restored after the build (mirrors build_profile.py).
+set "ORIG_VERSION="
+for /f "tokens=3 delims= " %%A in ('findstr /R "^APP_VERSION" "%~dp0gui_app.py"') do (
+    set "ORIG_VERSION=%%~A"
+)
+
 set "APP_VERSION="
+set "VERSION_PATCHED="
 if not "%~1"=="" (
     set "APP_VERSION=%~1"
 )
 
 REM If a version was supplied on the command line, patch gui_app.py
 if defined APP_VERSION (
-    echo [0/3] Setting version to %APP_VERSION% ...
+    echo [0/3] Temporarily setting version to %APP_VERSION% ...
     powershell -Command "(Get-Content '%~dp0gui_app.py') -replace 'APP_VERSION = \"[^\"]*\"', 'APP_VERSION = \"%APP_VERSION%\"' | Set-Content '%~dp0gui_app.py'"
+    set "VERSION_PATCHED=1"
     echo       Done.
     echo.
 ) else (
-    REM Read the version from gui_app.py
-    for /f "tokens=3 delims= " %%A in ('findstr /R "^APP_VERSION" "%~dp0gui_app.py"') do (
-        set "APP_VERSION=%%~A"
-    )
+    set "APP_VERSION=%ORIG_VERSION%"
 )
 
 echo       Building version: %APP_VERSION%
@@ -55,11 +61,18 @@ REM Stay in repo root where gui_app.py lives
 cd /d "%~dp0"
 
 REM ---------- Generate version-info file for Windows exe metadata ----------
+REM Normalize the version to a 4-part integer tuple for filevers/prodvers
+REM (mirrors build_profile.py version_tuple: leading digits per token else 0,
+REM pad with zeros to 4 parts, truncate past 4).
+set "FILEVERS="
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$p = '%APP_VERSION%'.Split('.') | ForEach-Object { if ($_ -match '^\d+') { [int]$Matches[0] } else { 0 } }; $p = @($p); while ($p.Count -lt 4) { $p += 0 }; ($p[0..3] -join ', ')"`) do set "FILEVERS=%%V"
+if not defined FILEVERS set "FILEVERS=0, 0, 0, 0"
+
 (
 echo VSVersionInfo^(
 echo   ffi=FixedFileInfo^(
-echo     filevers=^(%APP_VERSION:.=, %, 0^),
-echo     prodvers=^(%APP_VERSION:.=, %, 0^),
+echo     filevers=^(%FILEVERS%^),
+echo     prodvers=^(%FILEVERS%^),
 echo     mask=0x3f,
 echo     flags=0x0,
 echo     OS=0x40004,
@@ -158,12 +171,16 @@ if errorlevel 1 (
     echo [ERROR] Build failed! Check the output above for details.
     echo.
     del /q version_info.txt 2>nul
+    call :restore_version
     pause
     exit /b 1
 )
 
 REM Clean up temp version file
 del /q version_info.txt 2>nul
+
+REM Restore the original APP_VERSION if it was patched for this build
+call :restore_version
 
 echo.
 echo ============================================================
@@ -181,3 +198,14 @@ echo   to add an exclusion or sign the executable.
 echo ============================================================
 echo.
 pause
+exit /b 0
+
+REM ---------- Subroutines ----------
+:restore_version
+REM Put back the APP_VERSION that gui_app.py had before this build patched it
+REM (mirrors the finally-block restore in build_profile.py).
+if defined VERSION_PATCHED if defined ORIG_VERSION (
+    echo Restoring gui_app.py APP_VERSION to %ORIG_VERSION% ...
+    powershell -Command "(Get-Content '%~dp0gui_app.py') -replace 'APP_VERSION = \"[^\"]*\"', 'APP_VERSION = \"%ORIG_VERSION%\"' | Set-Content '%~dp0gui_app.py'"
+)
+goto :eof

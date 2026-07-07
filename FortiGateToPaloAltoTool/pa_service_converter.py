@@ -22,7 +22,13 @@ Output JSON:
 
 from typing import Any, Dict, List, Set, Tuple
 
-from pa_common import sanitize_name, is_default_fortigate_service
+from pa_common import (
+    PA_NAME_MAX_LENGTH,
+    sanitize_name,
+    is_default_fortigate_service,
+    first_item,
+    dedup_name,
+)
 
 
 # Protocols we skip (no equivalent PAN-OS service object)
@@ -47,6 +53,11 @@ class PAServiceConverter:
         self._service_name_mapping: Dict[str, List[Tuple[str, str]]] = {}
         self._skipped_services: Set[str] = set()
 
+        # FortiGate ICMP echo ("ping") services. No PAN-OS service object is
+        # created for these; rules referencing them get application "ping"
+        # instead (PAN-OS models ICMP as an application, not a service).
+        self._ping_services: Set[str] = set()
+
         # Statistics
         self._stats = {
             "total_objects": 0,
@@ -56,6 +67,7 @@ class PAServiceConverter:
             "multi_port_services": 0,
             "icmp_skipped": 0,
             "skipped_services": 0,
+            "ping_services": 0,
         }
 
     def convert(self) -> List[Dict]:
@@ -73,8 +85,10 @@ class PAServiceConverter:
         used_names: Dict[str, int] = {}
 
         for svc_dict in services:
-            svc_name = list(svc_dict.keys())[0]
-            properties = svc_dict[svc_name]
+            item = first_item(svc_dict)
+            if item is None:
+                continue
+            svc_name, properties = item
             protocol = str(properties.get("protocol", "")).strip().lower()
 
             # Silently ignore FortiGate factory-default services (e.g. "ALL").
@@ -83,6 +97,17 @@ class PAServiceConverter:
             if is_default_fortigate_service(svc_name):
                 print(f"  Ignored: {svc_name} (FortiGate default service)")
                 self._skipped_services.add(sanitize_name(svc_name))
+                continue
+
+            # ICMP echo ("ping") services: no PAN-OS service object exists for
+            # ICMP, but rules referencing them can use application "ping".
+            # Track them separately (also as skipped, so groups filter them).
+            if self._is_ping_service(svc_name, properties, protocol):
+                print(f"  Converted: {svc_name} -> application 'ping' "
+                      f"(ICMP echo service)")
+                self._ping_services.add(sanitize_name(svc_name))
+                self._skipped_services.add(sanitize_name(svc_name))
+                self._stats["ping_services"] += 1
                 continue
 
             # Skip non-port protocols
@@ -98,12 +123,12 @@ class PAServiceConverter:
                 sanitized_base = f"{sanitized_base}_custom"
 
             # Extract TCP and UDP port entries
-            tcp_ports = self._parse_ports(properties.get("tcp-portrange"))
-            udp_ports = self._parse_ports(properties.get("udp-portrange"))
+            tcp_ports = self._parse_ports(properties.get("tcp-portrange"), svc_name)
+            udp_ports = self._parse_ports(properties.get("udp-portrange"), svc_name)
 
             if not tcp_ports and not udp_ports:
                 # Attempt fallback for generic "portrange" key
-                generic = self._parse_ports(properties.get("portrange"))
+                generic = self._parse_ports(properties.get("portrange"), svc_name)
                 if generic and protocol in ("tcp", "6"):
                     tcp_ports = generic
                 elif generic and protocol in ("udp", "17"):
@@ -163,6 +188,10 @@ class PAServiceConverter:
     def get_skipped_services(self) -> Set[str]:
         return self._skipped_services
 
+    def get_ping_services(self) -> Set[str]:
+        """Sanitized names of ICMP echo services mapped to application 'ping'."""
+        return set(self._ping_services)
+
     def get_statistics(self) -> Dict[str, int]:
         return dict(self._stats)
 
@@ -188,16 +217,15 @@ class PAServiceConverter:
 
         for idx, port_val in enumerate(ports, start=1):
             if needs_suffix:
-                name = f"{base_name}_{proto_tag}_{idx}"
+                # Trim the base so the protocol/index suffix keeps the name
+                # within the PAN-OS 63-char limit.
+                suffix = f"_{proto_tag}_{idx}"
+                name = base_name[:PA_NAME_MAX_LENGTH - len(suffix)] + suffix
             else:
                 name = base_name
 
-            # Deduplicate
-            if name in used_names:
-                used_names[name] += 1
-                name = f"{name}_{used_names[name]}"
-            else:
-                used_names[name] = 1
+            # Deduplicate (re-trims to the PAN-OS 63-char limit)
+            name = dedup_name(name, used_names)
 
             obj = {
                 "name": name,
@@ -210,14 +238,30 @@ class PAServiceConverter:
         return objects
 
     @staticmethod
-    def _parse_ports(raw: Any) -> List[str]:
+    def _is_ping_service(
+        svc_name: str, properties: Dict, protocol: str
+    ) -> bool:
+        """Return True if this is an ICMP echo ("ping") service.
+
+        Matches the predefined PING service (by name) or any custom ICMPv4
+        service with icmptype 8 (echo request).
+        """
+        if str(svc_name).strip().lower() == "ping":
+            return True
+        if protocol not in ("icmp", "1"):
+            return False
+        icmptype = properties.get("icmptype", properties.get("icmp-type"))
+        return str(icmptype).strip() == "8"
+
+    def _parse_ports(self, raw: Any, svc_name: str = "") -> List[str]:
         """Parse FortiGate port definitions into a list of PAN-OS port strings.
 
         FortiGate formats:
             - 80           (int or str)
             - "80"
-            - "80-443"     (range with hyphen)
-            - "80:443"     (range with colon - FortiGate alternative)
+            - "80-443"     (destination-port range)
+            - "443:1024-65535"  (colon separates dst:src - the source-port
+                                 restriction is dropped with a failed_items note)
             - [80, "443", "8000-8999"]  (list)
 
         PAN-OS port format:
@@ -235,18 +279,30 @@ class PAServiceConverter:
             raw = raw.strip()
             if not raw:
                 return []
-            # Handle colon-separated source:dest port notation
-            # FortiGate uses "destport:sourceport" - we only care about dest
-            if ":" in raw and "-" not in raw:
-                parts = raw.split(":")
-                return [parts[0].strip()]
-            # Replace colon with hyphen for ranges
-            return [raw.replace(":", "-")]
+            # In FortiGate portranges a colon ALWAYS separates the destination
+            # ports from a source-port restriction ("dst[:src]"). PAN-OS
+            # service objects have no source-port field, so keep the
+            # destination part and record that the restriction was dropped.
+            if ":" in raw:
+                dst_part, _, src_part = raw.partition(":")
+                dst_part = dst_part.strip()
+                src_part = src_part.strip()
+                if src_part:
+                    self.failed_items.append({
+                        "name": svc_name,
+                        "reason": (
+                            f"source-port restriction '{src_part}' not "
+                            f"migrated (kept destination ports '{dst_part}')"
+                        ),
+                        "config": {"portrange": raw},
+                    })
+                return [dst_part] if dst_part else []
+            return [raw]
 
         if isinstance(raw, list):
             ports: List[str] = []
             for item in raw:
-                ports.extend(PAServiceConverter._parse_ports(item))
+                ports.extend(self._parse_ports(item, svc_name))
             return ports
 
         return []

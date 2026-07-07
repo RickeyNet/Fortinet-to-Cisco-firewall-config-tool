@@ -46,9 +46,9 @@ Option B - Export individual sections from the FDM REST API and combine
 
 REQUIRED KEYS
 --------------
-    network_objects, network_groups, tcp_ports, udp_ports, port_groups,
-    interfaces, etherchannel_interfaces, security_zones, static_routes,
-    access_rules
+    network_objects, network_groups, tcp_ports, udp_ports, icmpv4_ports,
+    icmpv6_ports, port_groups, interfaces, etherchannel_interfaces,
+    security_zones, static_routes, access_rules
 
 Any missing key is treated as an empty list (the converter will skip
 the corresponding conversion phase).
@@ -66,6 +66,8 @@ _SECTIONS: List[str] = [
     "network_groups",
     "tcp_ports",
     "udp_ports",
+    "icmpv4_ports",
+    "icmpv6_ports",
     "port_groups",
     "interfaces",
     "etherchannel_interfaces",

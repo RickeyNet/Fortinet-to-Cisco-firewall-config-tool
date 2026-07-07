@@ -12,7 +12,8 @@ import requests
 import threading
 import time
 import urllib3
-from typing import Any, Dict, Optional, Tuple
+from requests.structures import CaseInsensitiveDict
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from flair import flair
 
@@ -109,6 +110,21 @@ class FTDBaseClient:
         }
         return self.session.send(new_req, **send_kwargs)
 
+    def _set_auth_headers(self) -> None:
+        """Atomically install the bearer token on the session headers.
+
+        Builds a complete new headers mapping and REBINDS it in a single
+        assignment instead of mutating the existing dict in place.  Worker
+        threads may be iterating ``session.headers`` while preparing
+        requests, and an in-place ``.update()`` could raise
+        "dictionary changed size during iteration".
+        """
+        new_headers = CaseInsensitiveDict(self.session.headers)
+        new_headers["Authorization"] = f"Bearer {self.access_token}"
+        new_headers["Content-Type"] = "application/json"
+        new_headers["Accept"] = "application/json"
+        self.session.headers = new_headers  # type: ignore[assignment]
+
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
@@ -148,11 +164,7 @@ class FTDBaseClient:
                 self.access_token = tokens.get("access_token")
                 self.refresh_token = tokens.get("refresh_token")
 
-                self.session.headers.update({
-                    "Authorization": f"Bearer {self.access_token}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                })
+                self._set_auth_headers()
 
                 print(flair("auth", "OK"))
                 return True
@@ -229,7 +241,7 @@ class FTDBaseClient:
                         tokens = resp.json()
                         self.access_token = tokens.get("access_token")
                         self.refresh_token = tokens.get("refresh_token")
-                        self.session.headers.update({"Authorization": f"Bearer {self.access_token}"})
+                        self._set_auth_headers()
                         self._last_refresh_time = time.time()
                         print("  [AUTH] Token refreshed via refresh_token grant.")
                         return True
@@ -248,7 +260,7 @@ class FTDBaseClient:
                     tokens = resp.json()
                     self.access_token = tokens.get("access_token")
                     self.refresh_token = tokens.get("refresh_token")
-                    self.session.headers.update({"Authorization": f"Bearer {self.access_token}"})
+                    self._set_auth_headers()
                     self._last_refresh_time = time.time()
                     print("  [AUTH] Token refreshed via password re-authentication.")
                     return True
@@ -257,6 +269,191 @@ class FTDBaseClient:
                 print(f"  [AUTH] Token refresh error: {e}")
 
             return False
+
+    # ------------------------------------------------------------------
+    # Shared pagination helpers
+    # ------------------------------------------------------------------
+    def get_paged_items(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        page_limit: int = 100,
+        timeout: int = 30,
+    ) -> Tuple[bool, Union[List[Dict[str, Any]], str]]:
+        """Fetch every item from a list endpoint, following pagination.
+
+        The offset advances by the *actual* number of items returned (a page
+        may contain fewer than ``page_limit`` items), so short pages never
+        cause objects to be skipped.
+
+        Args:
+            url: Full URL of the list endpoint.
+            params: Optional extra query parameters merged into each page GET.
+            page_limit: Page size to request.
+            timeout: Per-request timeout in seconds.
+
+        Returns:
+            (True, items) on success, (False, error_message) on any
+            HTTP/network/parse error.
+        """
+        all_items: List[Dict[str, Any]] = []
+        offset = 0
+        try:
+            while True:
+                page_params: Dict[str, Any] = dict(params or {})
+                page_params.update({"offset": offset, "limit": page_limit})
+                response = self.session.get(url, params=page_params, timeout=timeout)
+                if response.status_code != 200:
+                    return False, f"API error: {response.status_code}"
+                data = response.json()
+                items = data.get("items", [])
+                if not items:
+                    break
+                all_items.extend(items)
+                offset += len(items)
+                paging = data.get("paging", {}) or {}
+                count = paging.get("count")
+                if isinstance(count, int):
+                    if offset >= count:
+                        break
+                elif not paging.get("next"):
+                    break
+            return True, all_items
+        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
+            return False, str(e)
+
+    def find_object_by_name(
+        self,
+        url: str,
+        name: str,
+        match: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        page_limit: int = 100,
+        timeout: int = 30,
+    ) -> Tuple[bool, Union[Dict[str, Any], str]]:
+        """Look up an object by name on a list endpoint.
+
+        Tries the ``filter=name:...`` query first, then falls back to a full
+        paginated scan.  An exact name match always wins; the optional
+        ``match`` predicate is only used when no name match exists (for
+        duplicates keyed on something other than name, e.g. a subinterface's
+        VLAN ID).
+
+        Returns:
+            (True, object_dict) if found, (False, error_message) otherwise.
+        """
+        try:
+            # Try the filter parameter first (cheap when supported).
+            response = self.session.get(
+                url, params={"filter": f"name:{name}", "limit": 10}, timeout=timeout,
+            )
+            if response.status_code == 200:
+                for obj in response.json().get("items", []):
+                    if obj.get("name") == name:
+                        return True, obj
+
+            # Fallback: paginated scan, advancing by the actual page size.
+            fallback_obj = None
+            offset = 0
+            while True:
+                response = self.session.get(
+                    url, params={"offset": offset, "limit": page_limit}, timeout=timeout,
+                )
+                if response.status_code != 200:
+                    return False, f"API error: {response.status_code}"
+                data = response.json()
+                items = data.get("items", [])
+                for obj in items:
+                    if obj.get("name") == name:
+                        return True, obj
+                    if fallback_obj is None and match is not None and match(obj):
+                        fallback_obj = obj
+                if not items:
+                    break
+                offset += len(items)
+                paging = data.get("paging", {}) or {}
+                count = paging.get("count")
+                if isinstance(count, int):
+                    if offset >= count:
+                        break
+                elif not paging.get("next"):
+                    break
+            if fallback_obj is not None:
+                return True, fallback_obj
+            return False, f"Object not found: {name}"
+        except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
+            return False, str(e)
+
+    # ------------------------------------------------------------------
+    # Deployment polling
+    # ------------------------------------------------------------------
+    _DEPLOY_SUCCESS_STATES = {"DEPLOYED"}
+    _DEPLOY_FAILURE_STATES = {"FAILED", "CANCELLED"}
+
+    def poll_deployment(
+        self,
+        deployment_id: str,
+        timeout: float = 600.0,
+        interval: float = 10.0,
+    ) -> bool:
+        """Poll a deployment task until it reaches a terminal state.
+
+        Args:
+            deployment_id: Task id returned by POST /operational/deploy.
+            timeout: Maximum seconds to wait for a terminal state.
+            interval: Seconds between status polls.
+
+        Returns:
+            True when the deployment finished successfully, False on
+            deployment failure or timeout.
+        """
+        url = f"{self.base_url}/operational/deploy/{deployment_id}"
+        deadline = time.time() + timeout
+        start = time.time()
+        last_state = ""
+        while time.time() < deadline:
+            try:
+                resp = self.session.get(url, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    state = str(data.get("state", "")).upper()
+                    if state != last_state:
+                        elapsed = int(time.time() - start)
+                        print(f"  Deployment state: {state or 'UNKNOWN'} ({elapsed}s elapsed)")
+                        last_state = state
+                    if state in self._DEPLOY_SUCCESS_STATES:
+                        print("  Deployment completed successfully.")
+                        return True
+                    if state in self._DEPLOY_FAILURE_STATES:
+                        detail = str(data.get("statusMessage") or state)
+                        print(f"  Deployment failed: {detail}")
+                        return False
+                else:
+                    print(f"  Deployment status check failed: HTTP {resp.status_code}")
+            except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
+                print(f"  Deployment status check error: {e}")
+            time.sleep(interval)
+        print(f"  Deployment did not reach a terminal state within {int(timeout)}s - "
+              "check the FDM web interface for status.")
+        return False
+
+    def start_and_wait_deployment(self, response: requests.Response) -> bool:
+        """Poll the deployment task from a successful deploy POST response.
+
+        Extracts the task id from the POST /operational/deploy response and
+        polls it until a terminal state.  When no task id is present the
+        deployment is assumed to be initiated (legacy behavior) and True is
+        returned with a note.
+        """
+        dep_id = None
+        try:
+            dep_id = response.json().get("id")
+        except (ValueError, TypeError, AttributeError):
+            dep_id = None
+        if not dep_id:
+            print("  Deployment initiated, but no task id was returned - "
+                  "check FDM web interface for status.")
+            return True
+        return self.poll_deployment(str(dep_id))
 
     # ------------------------------------------------------------------
     # Endpoint validation

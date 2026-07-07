@@ -17,7 +17,7 @@ Output JSON:
 
 from typing import Any, Dict, List, Set, Tuple
 
-from pa_common import sanitize_name, build_group_lookup
+from pa_common import sanitize_name, build_group_lookup, first_item, dedup_name
 
 
 class PAServiceGroupConverter:
@@ -33,6 +33,11 @@ class PAServiceGroupConverter:
         self._service_name_mapping: Dict[str, List[Tuple[str, str]]] = {}
         self._skipped_services: Set[str] = set()
 
+        # FortiGate group name (raw and sanitized) -> final PAN-OS group name.
+        self._name_map: Dict[str, str] = {}
+        # Groups that were skipped entirely (no members / all filtered).
+        self._skipped_groups: Set[str] = set()
+
     def set_split_services(
         self,
         split_services: Set[str],
@@ -43,6 +48,14 @@ class PAServiceGroupConverter:
         self._split_services = split_services
         self._service_name_mapping = service_name_mapping
         self._skipped_services = skipped_services
+
+    def get_name_map(self) -> Dict[str, str]:
+        """FortiGate group name (raw and sanitized) -> final PAN-OS name."""
+        return dict(self._name_map)
+
+    def get_skipped_groups(self) -> Set[str]:
+        """Names (raw and sanitized) of groups that were not converted."""
+        return set(self._skipped_groups)
 
     def convert(self) -> List[Dict]:
         """Convert all FortiGate service groups to PAN-OS format.
@@ -62,8 +75,10 @@ class PAServiceGroupConverter:
         used_names: Dict[str, int] = {}
 
         for group_dict in groups:
-            group_name = list(group_dict.keys())[0]
-            properties = group_dict[group_name]
+            item = first_item(group_dict)
+            if item is None:
+                continue
+            group_name, properties = item
 
             # Extract raw members
             members_raw = properties.get("member", [])
@@ -79,6 +94,7 @@ class PAServiceGroupConverter:
                     "reason": "no members",
                     "config": properties,
                 })
+                self._mark_skipped(group_name)
                 continue
 
             # Resolve each member through the service name mapping
@@ -113,15 +129,13 @@ class PAServiceGroupConverter:
                     "reason": "all members filtered out",
                     "config": properties,
                 })
+                self._mark_skipped(group_name)
                 continue
 
             # Sanitize group name (deduplicate)
-            sanitized = sanitize_name(group_name)
-            if sanitized in used_names:
-                used_names[sanitized] += 1
-                sanitized = f"{sanitized}_{used_names[sanitized]}"
-            else:
-                used_names[sanitized] = 1
+            sanitized = dedup_name(sanitize_name(group_name), used_names)
+            self._name_map[group_name] = sanitized
+            self._name_map.setdefault(sanitize_name(group_name), sanitized)
 
             pa_group = {
                 "name": sanitized,
@@ -136,3 +150,7 @@ class PAServiceGroupConverter:
 
         self.pa_service_groups = results
         return results
+
+    def _mark_skipped(self, group_name: str) -> None:
+        self._skipped_groups.add(str(group_name))
+        self._skipped_groups.add(sanitize_name(group_name))

@@ -2,7 +2,7 @@
 """Shared utilities for converter modules."""
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _SANITIZE_PATTERN = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -134,6 +134,58 @@ def sanitize_name(name: str) -> str:
     return sanitized
 
 
+def first_item(entry: Any) -> Optional[Tuple[Any, Dict[str, Any]]]:
+    """Return the (name, properties) pair of a single-key FortiGate YAML entry.
+
+    FortiGate sections parse into lists of ``{NAME: {props}}`` dicts. Empty or
+    malformed entries (None, ``{}``, non-dict properties) return None so
+    callers can skip them instead of crashing on ``list(d.keys())[0]``.
+    """
+    if not isinstance(entry, dict) or not entry:
+        return None
+    name = next(iter(entry))
+    props = entry[name]
+    if not isinstance(props, dict):
+        return None
+    return name, props
+
+
+def dedupe_name(base: str, used_names: Dict[str, int]) -> str:
+    """Return a unique name for *base*, appending _2/_3... on collision.
+
+    Generated names are registered in *used_names* too, so a later literal
+    source name that matches a generated suffix (e.g. ``X_2``) is itself
+    deduplicated instead of colliding.
+    """
+    if base not in used_names:
+        used_names[base] = 1
+        return base
+    counter = used_names[base] + 1
+    while f"{base}_{counter}" in used_names:
+        counter += 1
+    used_names[base] = counter
+    final = f"{base}_{counter}"
+    used_names[final] = 1
+    return final
+
+
+def netmask_to_cidr(netmask: str) -> int:
+    """Convert a dotted-decimal netmask to a CIDR prefix length.
+
+    Falls back to /32 (single host - the fail-closed choice) with a warning
+    when the netmask is invalid.
+    """
+    try:
+        octets = str(netmask).split('.')
+        if len(octets) != 4:
+            raise ValueError("expected 4 octets")
+        binary_str = ''.join(bin(int(octet))[2:].zfill(8) for octet in octets)
+        return binary_str.count('1')
+    except (ValueError, AttributeError):
+        print(f"  Warning: invalid netmask '{netmask}' - defaulting to /32")
+        return 32
+
+
 # ---------------------------------------------------------------------------
 # Group-flattening helpers (used by address_group_converter & service_group_converter)
 # ---------------------------------------------------------------------------
@@ -149,9 +201,11 @@ def build_group_lookup(group_entries: List[Dict[str, Any]]) -> Dict[str, List[st
         ``{group_name: [member1, member2, ...]}`` with all names sanitized.
     """
     lookup: Dict[str, List[str]] = {}
-    for group_dict in group_entries:
-        group_name = list(group_dict.keys())[0]
-        properties = group_dict[group_name]
+    for group_dict in group_entries or []:
+        item = first_item(group_dict)
+        if item is None:
+            continue
+        group_name, properties = item
 
         members_raw = properties.get("member", [])
         if isinstance(members_raw, str):
@@ -175,7 +229,10 @@ def flatten_group_members(
     Args:
         members: Member names (may include group names).
         group_lookup: Mapping returned by :func:`build_group_lookup`.
-        visited: Already-visited group names (circular-reference guard).
+        visited: Group names on the CURRENT recursion path (circular-reference
+            guard). Entries are removed on the way back up so diamond-shaped
+            references (two siblings sharing a nested group) are not falsely
+            flagged as circular.
 
     Returns:
         Deduplicated list of individual object names (order-preserving).
@@ -195,6 +252,8 @@ def flatten_group_members(
 
             nested_members = group_lookup.get(member, [])
             expanded = flatten_group_members(nested_members, group_lookup, visited)
+
+            visited.discard(member)
 
             print(f"    Flattening nested group '{member}' -> {len(expanded)} objects")
             flattened.extend(expanded)

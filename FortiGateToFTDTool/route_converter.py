@@ -56,7 +56,7 @@ IMPORTANT NOTES:
 import json
 from typing import Dict, List, Any, Optional
 
-from common import sanitize_name
+from common import sanitize_name, first_item, netmask_to_cidr
 
 
 class RouteConverter:
@@ -321,10 +321,15 @@ class RouteConverter:
         if existing:
             return {"name": existing.get("name", name), "type": "networkobject"}
 
-        # 2) If an object exists for this value, reuse it (avoid duplicates by value).
+        # 2) If an object exists for this value, reuse it (avoid duplicates by
+        #    value). For HOST requests the existing object must itself be a
+        #    host - base-IP aliases can point at NETWORK objects, which are
+        #    not interchangeable with a host (e.g. as a route next-hop).
         existing_name = self.ip_to_network_object_name.get(value)
         if existing_name and existing_name in self.name_to_network_object:
-            return {"name": existing_name, "type": "networkobject"}
+            existing_obj = self.name_to_network_object[existing_name]
+            if sub_type != "HOST" or self._is_host_object_value(existing_obj.get('value', '')):
+                return {"name": existing_name, "type": "networkobject"}
 
         # 3) Create new object (track it for export + later imports)
         new_obj = {
@@ -504,6 +509,29 @@ class RouteConverter:
         return network_addr
         
 
+    @staticmethod
+    def _value_matches_destination(obj_value: str, network_cidr: str,
+                                   ip_addr: str, cidr: int) -> bool:
+        """
+        Decide whether an existing object's value really represents a route
+        destination. Network routes require an EXACT CIDR match; a host object
+        (plain IP or IP/32) may only match a /32 route - otherwise a HOST
+        object would silently stand in for a whole network.
+        """
+        if obj_value == network_cidr:
+            return True
+        if cidr == 32:
+            return obj_value in (ip_addr, f"{ip_addr}/32")
+        return False
+
+    @staticmethod
+    def _is_host_object_value(obj_value: str) -> bool:
+        """True if an object's value is a single host (plain IP or IP/32)."""
+        v = str(obj_value).strip()
+        if not v or '-' in v:
+            return False
+        return '/' not in v or v.endswith('/32')
+
     def _get_network_object_for_destination(self, dst: List) -> Optional[Dict]:
         """
         Get the full network object for a route destination.
@@ -551,14 +579,14 @@ class RouteConverter:
                 self._destination_cache[cache_key] = ref
                 return ref.copy()
 
-        # 2) Match by network base address only (verify CIDR matches)
+        # 2) Match by network base address only (verify the value really covers
+        #    this route: exact CIDR for network routes; host form only for /32)
         obj_name = self.ip_to_network_object_name.get(network_addr)
         if obj_name:
             obj = self.name_to_network_object.get(obj_name)
             if obj:
                 obj_value = str(obj.get('value', '')).strip()
-                # Only use if CIDR matches or the object is a plain host (no slash)
-                if obj_value == network_cidr or '/' not in obj_value:
+                if self._value_matches_destination(obj_value, network_cidr, ip_addr, cidr):
                     ref = obj.copy()
                     self._destination_cache[cache_key] = ref
                     return ref.copy()
@@ -569,8 +597,7 @@ class RouteConverter:
             obj = self.name_to_network_object.get(obj_name)
             if obj:
                 obj_value = str(obj.get('value', '')).strip()
-                # Only use if CIDR matches or the object is a plain host (no slash)
-                if obj_value == network_cidr or '/' not in obj_value:
+                if self._value_matches_destination(obj_value, network_cidr, ip_addr, cidr):
                     ref = obj.copy()
                     self._destination_cache[cache_key] = ref
                     return ref.copy()
@@ -633,20 +660,17 @@ class RouteConverter:
         if cached:
             return cached.copy()
 
-        # Try with /32 CIDR notation first
+        # Try with /32 CIDR notation first, then without CIDR. Only accept
+        # HOST-type objects: the base-IP aliases in the lookup can point at
+        # NETWORK objects (e.g. "10.0.0.0" -> 10.0.0.0/24), and a network is
+        # not a valid next-hop - fall through and create a host object instead.
         gateway_cidr = f"{gateway_ip}/32"
-        if gateway_cidr in self.ip_to_network_object_name:
-            obj_name = self.ip_to_network_object_name[gateway_cidr]
+        for lookup_key in (gateway_cidr, gateway_ip):
+            obj_name = self.ip_to_network_object_name.get(lookup_key)
+            if not obj_name:
+                continue
             obj = self.name_to_network_object.get(obj_name)
-            if obj:
-                self._gateway_cache[gateway_ip] = obj
-                return obj.copy()
-
-        # Try without CIDR
-        if gateway_ip in self.ip_to_network_object_name:
-            obj_name = self.ip_to_network_object_name[gateway_ip]
-            obj = self.name_to_network_object.get(obj_name)
-            if obj:
+            if obj and self._is_host_object_value(obj.get('value', '')):
                 self._gateway_cache[gateway_ip] = obj
                 return obj.copy()
 
@@ -742,9 +766,12 @@ class RouteConverter:
             # ================================================================
             # Each route looks like: {64: {dst: ..., gateway: ...}}
             # The route ID is the key (e.g., 64)
-            route_id = list(route_dict.keys())[0]
-            properties = route_dict[route_id]
-            
+            item = first_item(route_dict)
+            if item is None:
+                print("  Skipped: empty/malformed route entry")
+                continue
+            route_id, properties = item
+
             # ================================================================
             # STEP 2B: Check if this is a blackhole route
             # ================================================================
@@ -784,15 +811,13 @@ class RouteConverter:
             # NOTE: Interface must be resolved BEFORE gateway so that auto-created
             # gateway objects can inherit the correct subnet prefix from the interface
             fg_interface_name = properties.get('device', 'unknown')
-            
+
             # Map FortiGate interface name to FTD interface name
-            if fg_interface_name in self.interface_name_mapping:
-                ftd_interface_name = self.interface_name_mapping[fg_interface_name]
-            else:
-                ftd_interface_name = self.interface_name_mapping.get(
-                    fg_interface_name, 
-                    fg_interface_name.lower().replace('-', '_')
-                )
+            # (str() - YAML can yield int-named interfaces, e.g. VLAN "551")
+            ftd_interface_name = self.interface_name_mapping.get(
+                fg_interface_name,
+                str(fg_interface_name).lower().replace('-', '_')
+            )
             
             # Get the full interface object
             interface_obj = self._get_interface_object(ftd_interface_name) # type: ignore
@@ -932,27 +957,10 @@ class RouteConverter:
         Returns:
             Integer representing CIDR prefix length (e.g., 24)
         """
-        try:
-            # Split the netmask into individual octets
-            octets = netmask.split('.')
-            
-            # Convert each octet to binary and concatenate
-            binary_str = ''
-            for octet in octets:
-                # Convert to binary and pad to 8 bits
-                binary_octet = bin(int(octet))[2:].zfill(8)
-                binary_str += binary_octet
-            
-            # Count the number of '1' bits
-            cidr_prefix = binary_str.count('1')
-            
-            return cidr_prefix
-            
-        except (ValueError, AttributeError):
-            # If conversion fails, default to /32
-            print(f"    Warning: Could not convert netmask '{netmask}' to CIDR")
-            return 32
-        
+        # Shared implementation (warns and defaults to /32 on invalid input)
+        return netmask_to_cidr(netmask)
+
+
     def _get_interface_ipv4_prefix(self, interface_obj: Dict) -> Optional[int]:
         """
         Extract the IPv4 prefix length for a converted interface object.
@@ -980,147 +988,6 @@ class RouteConverter:
 
         return self._netmask_to_cidr(str(netmask))
 
-    
-    def _create_network_name(self, dst: List) -> str:
-        """
-        Find the interface name for the destination network.
-        
-        This method looks up the destination IP/network to find which interface
-        it's configured on, then returns that interface name.
-        
-        This allows FTD routes to reference interface names as the network object.
-        
-        Args:
-            dst: List containing [IP_address, netmask]
-            
-        Returns:
-            String name of the interface where this network exists, or a generated name if no match
-        """
-        if len(dst) < 2:
-            return "Unknown_Network"
-        
-        ip_addr = str(dst[0])
-        netmask = str(dst[1])
-        cidr = self._netmask_to_cidr(netmask)
-        
-        # Check if this is a default route (0.0.0.0/0)
-        if ip_addr == "0.0.0.0" and cidr == 0:
-            return "any-ipv4"
-        
-        # Calculate network address
-        network_addr = self._calculate_network_address(ip_addr, netmask)
-        network_cidr = f"{network_addr}/{cidr}"
-        
-        if self.debug:
-            print(f"\n    [DEBUG] Looking up network: {network_cidr}")
-        
-        # Try to find the interface by network CIDR
-        if network_cidr in self.ip_to_interface: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_interface[network_cidr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found interface by network CIDR: {result}")
-            return result
-        
-        # Try to find by network address only
-        if network_addr in self.ip_to_interface: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_interface[network_addr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found interface by network address: {result}")
-            return result
-        
-        # Try to find by IP address (in case it's a host route)
-        if ip_addr in self.ip_to_interface: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_interface[ip_addr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found interface by IP address: {result}")
-            return result
-        
-        if self.debug:
-            print("    [DEBUG] No interface found, trying address objects...")
-        
-        # FALLBACK: Try legacy address object lookup
-        cidr_notation = f"{ip_addr}/{cidr}"
-        
-        # Try to find the address object by exact CIDR match
-        if cidr_notation in self.ip_to_name: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_name[cidr_notation] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found address object by CIDR: {result}")
-            return result
-        
-        # Try to find by IP only (for host addresses)
-        if ip_addr in self.ip_to_name: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_name[ip_addr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found address object by IP: {result}")
-            return result
-        
-        # No match found - generate a name and warn the user
-        self.unmatched_count += 1
-        generated_name = f"Net_{ip_addr.replace('.', '_')}_{cidr}"
-        print(f"    Warning: No interface or address object found for {cidr_notation}, using generated name: {generated_name}")
-        
-        return generated_name
-    
-    def _create_gateway_name(self, gateway_ip: str, properties: Dict) -> str:
-        """
-        Find the interface name for the gateway IP.
-        
-        This method looks up the gateway IP to find which interface network
-        it belongs to, then returns that interface name.
-        
-        This allows FTD routes to reference interface names as the gateway object.
-        
-        Args:
-            gateway_ip: Gateway IP address as string
-            properties: Route properties dictionary (for comment field)
-            
-        Returns:
-            String name of the interface where this gateway exists, or a generated name if no match
-        """
-        if self.debug:
-            print(f"\n    [DEBUG] Looking up gateway: {gateway_ip}")
-        
-        # Try to find the interface by gateway IP
-        # The gateway is typically an IP address on a directly connected network
-        
-        # First try exact IP match
-        if gateway_ip in self.ip_to_interface: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_interface[gateway_ip] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found interface by IP: {result}")
-            return result
-        
-        # Try with /32 CIDR notation
-        gateway_cidr = f"{gateway_ip}/32"
-        if gateway_cidr in self.ip_to_interface: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_interface[gateway_cidr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found interface by CIDR: {result}")
-            return result
-        
-        if self.debug:
-            print("    [DEBUG] No interface found, trying address objects...")
-        
-        # FALLBACK: Try legacy address object lookup
-        if gateway_cidr in self.ip_to_name: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_name[gateway_cidr] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found address object by CIDR: {result}")
-            return result
-        
-        if gateway_ip in self.ip_to_name: # pyright: ignore[reportAttributeAccessIssue]
-            result = self.ip_to_name[gateway_ip] # pyright: ignore[reportAttributeAccessIssue]
-            if self.debug:
-                print(f"    [DEBUG] Found address object by IP: {result}")
-            return result
-        
-        # No match found - generate a name and warn the user
-        self.unmatched_count += 1
-        generated_name = f"Gateway_{gateway_ip.replace('.', '_')}"
-        print(f"    Warning: No interface or address object found for gateway {gateway_ip}, using generated name: {generated_name}")
-        
-        return generated_name
     
     def get_statistics(self) -> Dict[str, int]:
         """

@@ -628,7 +628,17 @@ class PAInterfaceConverter:
             })
             return
 
-        vlan_id = int(vlan_id)
+        vlan_id = self._parse_int(vlan_id, 0)
+        if vlan_id <= 0:
+            print(f"    Skipped: {fg_name} (invalid VLAN ID: "
+                  f"{properties.get('vlanid')!r})")
+            self._stats["skipped"] += 1
+            self.failed_items.append({
+                "name": fg_name,
+                "reason": f"invalid VLAN ID: {properties.get('vlanid')!r}",
+                "config": properties,
+            })
+            return
 
         # Find the PAN-OS parent interface name
         parent_pa = self.interface_name_mapping.get(parent_fg)

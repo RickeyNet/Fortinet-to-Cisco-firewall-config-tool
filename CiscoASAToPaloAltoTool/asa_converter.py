@@ -5,7 +5,7 @@ Cisco ASA to Palo Alto PAN-OS Configuration Converter
 Converts a Cisco ASA running-config text file to PAN-OS JSON files that
 are compatible with the existing panos_api_importer.
 
-OUTPUT FILES (same schema as the FortiGate→PAN-OS converter):
+OUTPUT FILES (same schema as the FortiGate->PAN-OS converter):
     {basename}_interfaces.json
     {basename}_address_objects.json
     {basename}_address_groups.json
@@ -67,16 +67,16 @@ def convert_interfaces(
     Returns:
         (pa_interfaces, pa_zones, interface_name_mapping, zone_mapping)
 
-    interface_name_mapping: ASA nameif → PAN-OS ethernet name
-    zone_mapping:           ASA nameif → PAN-OS zone name
+    interface_name_mapping: ASA nameif -> PAN-OS ethernet name
+    zone_mapping:           ASA nameif -> PAN-OS zone name
     """
     model_info = PA_MODELS.get(target_model, PA_MODELS["pa-440"])
     total_ports = model_info["total_ports"]
 
     pa_interfaces: List[Dict] = []
     zone_to_members: Dict[str, List[str]] = {}
-    intf_map: Dict[str, str] = {}   # nameif → ethernet name
-    zone_map: Dict[str, str] = {}   # nameif → zone name
+    intf_map: Dict[str, str] = {}   # nameif -> ethernet name
+    zone_map: Dict[str, str] = {}   # nameif -> zone name
 
     port_index = 1
 
@@ -89,9 +89,11 @@ def convert_interfaces(
         if intf.get("management_only"):
             print(f"    Skipped data-plane mapping: {intf['hw_id']} "
                   f"(management-only)")
-            # Still create a zone for management
+            # Still create a zone for management (an interface-less zone is
+            # valid in PAN-OS) so rules bound to it import cleanly
             zone_name = sanitize_name(nameif)
             zone_map[nameif] = zone_name
+            zone_to_members.setdefault(zone_name, [])
             continue
 
         if port_index > total_ports:
@@ -108,12 +110,17 @@ def convert_interfaces(
             cidr = netmask_to_cidr(intf["netmask"])
             ip_cidr = f"{intf['ip_address']}/{cidr}"
 
+        # Preserve the ASA security-level in the comment for reference
+        comment = intf.get("description", "")
+        sec_note = f"ASA security-level {intf.get('security_level', 0)}"
+        comment = f"{comment} [{sec_note}]" if comment else sec_note
+
         pa_intf: Dict[str, Any] = {
             "name": pa_name,
             "type": "physical",
             "ip_address": ip_cidr,
-            "comment": intf.get("description", ""),
-            "enabled": not intf.get("shutdown", True),
+            "comment": comment,
+            "enabled": not intf.get("shutdown", False),
             "link_speed": "auto",
         }
         pa_interfaces.append(pa_intf)
@@ -125,7 +132,7 @@ def convert_interfaces(
 
         zone_to_members.setdefault(zone_name, []).append(pa_name)
 
-        print(f"  Mapped: {intf['hw_id']} ({nameif}) → {pa_name} "
+        print(f"  Mapped: {intf['hw_id']} ({nameif}) -> {pa_name} "
               f"[zone: {zone_name}] {ip_cidr}")
 
     # Build zone list
@@ -139,14 +146,17 @@ def convert_interfaces(
 
 def convert_address_objects(
     parsed: Dict[str, Any],
-    inline_hosts: Optional[Dict[str, str]] = None,
-) -> List[Dict]:
+) -> Tuple[List[Dict], Dict[str, str], Set[str]]:
     """Convert ASA network objects to PAN-OS address objects.
 
-    Also includes any ad-hoc host objects created from inline ACL references.
+    Returns (pa_address_objects, name_map, used_names) where name_map maps
+    the original ASA object name to the emitted PAN-OS name, so renames
+    from sanitizing/deduping propagate to every reference. Skipped objects
+    have no name_map entry.
     """
     results: List[Dict] = []
     used_names: Set[str] = set()
+    name_map: Dict[str, str] = {}
 
     for obj_name, obj in parsed["network_objects"].items():
         sanitized = sanitize_name(obj_name)
@@ -189,33 +199,50 @@ def convert_address_objects(
             continue
 
         results.append(pa_obj)
-        print(f"  Converted: {obj_name} → {sanitized} [{pa_obj['type']}] "
+        name_map[obj_name] = sanitized
+        print(f"  Converted: {obj_name} -> {sanitized} [{pa_obj['type']}] "
               f"({pa_obj['value']})")
 
-    # Add ad-hoc host objects for inline ACL/group references
-    if inline_hosts:
-        for host_name, ip in inline_hosts.items():
-            if host_name in used_names:
-                continue
-            used_names.add(host_name)
-            results.append({
-                "name": host_name,
-                "type": "ip-netmask",
-                "value": f"{ip}/32",
-                "description": "Auto-created from inline reference",
-            })
-            print(f"  Auto-created: {host_name} → {ip}/32")
+    return results, name_map, used_names
 
-    return results
+
+def append_inline_address_objects(
+    results: List[Dict],
+    inline_hosts: Dict[str, str],
+    used_names: Set[str],
+) -> None:
+    """Append ad-hoc address objects created from inline ACL/group refs.
+
+    inline_hosts values are either bare IPs (host refs) or CIDR strings
+    (subnet refs) - only bare IPs get a /32 suffix.
+    """
+    for host_name, ip in inline_hosts.items():
+        if host_name in used_names:
+            continue
+        used_names.add(host_name)
+        value = ip if "/" in ip else f"{ip}/32"
+        results.append({
+            "name": host_name,
+            "type": "ip-netmask",
+            "value": value,
+            "description": "Auto-created from inline reference",
+        })
+        print(f"  Auto-created: {host_name} -> {value}")
 
 
 def convert_address_groups(
     parsed: Dict[str, Any],
     inline_hosts: Dict[str, str],
+    addr_map: Dict[str, str],
+    used_names: Set[str],
+    warnings: List[str],
 ) -> List[Dict]:
-    """Convert ASA network object-groups to PAN-OS address groups."""
+    """Convert ASA network object-groups to PAN-OS address groups.
+
+    addr_map (ASA name -> emitted PAN-OS name) is shared with the address
+    object converter so renames propagate; groups register themselves too.
+    """
     results: List[Dict] = []
-    used_names: Set[str] = set()
 
     for grp_name, grp in parsed["network_object_groups"].items():
         sanitized = sanitize_name(grp_name)
@@ -225,10 +252,18 @@ def convert_address_groups(
 
         for member in grp.get("members", []):
             mtype = member.get("type", "")
-            if mtype == "object":
-                members.append(sanitize_name(member["name"]))
-            elif mtype == "group":
-                members.append(sanitize_name(member["name"]))
+            if mtype in ("object", "group"):
+                ref = member["name"]
+                mapped = addr_map.get(ref)
+                if mapped is None:
+                    warnings.append(
+                        f"Address group '{grp_name}': member '{ref}' was "
+                        f"not converted - member dropped, review manually"
+                    )
+                    print(f"  WARNING: {grp_name}: unresolved member "
+                          f"'{ref}' dropped")
+                    continue
+                members.append(mapped)
             elif mtype == "host":
                 # Create an ad-hoc host object
                 host_name = f"host_{member['value'].replace('.', '_')}"
@@ -254,82 +289,143 @@ def convert_address_groups(
             "members": members,
             "description": "",
         })
-        print(f"  Converted: {grp_name} → {sanitized} "
+        addr_map[grp_name] = sanitized
+        print(f"  Converted: {grp_name} -> {sanitized} "
               f"({len(members)} members)")
 
     return results
 
 
+def _split_protocol(protocol: str) -> List[str]:
+    """Expand ASA 'tcp-udp' into the two valid PAN-OS protocols."""
+    if protocol == "tcp-udp":
+        return ["tcp", "udp"]
+    return [protocol]
+
+
 def convert_service_objects(
     parsed: Dict[str, Any],
-    inline_services: Optional[Dict[str, Dict]] = None,
-) -> List[Dict]:
-    """Convert ASA service objects to PAN-OS service objects."""
+    warnings: List[str],
+) -> Tuple[List[Dict], Dict[str, List[str]], Set[str]]:
+    """Convert ASA service objects to PAN-OS service objects.
+
+    Returns (pa_service_objects, svc_map, used_names) where svc_map maps the
+    original ASA name to the list of emitted PAN-OS service names (tcp-udp
+    objects expand to one tcp + one udp service). Skipped services have no
+    svc_map entry, so references to them fail closed instead of dangling.
+    """
     results: List[Dict] = []
     used_names: Set[str] = set()
+    svc_map: Dict[str, List[str]] = {}
 
     for svc_name, svc in parsed["service_objects"].items():
         protocol = svc.get("protocol", "")
         dst_port = svc.get("dst_port", "")
 
-        if not protocol or protocol in ("icmp", "icmp6", "ip"):
+        if not protocol or protocol.split("-")[0] not in ("tcp", "udp"):
             print(f"  Skipped: {svc_name} (protocol '{protocol}' - "
                   f"no PAN-OS service equivalent)")
+            warnings.append(
+                f"Service object '{svc_name}' (protocol '{protocol}') has "
+                f"no PAN-OS service equivalent - review manually"
+            )
             continue
 
         if not dst_port:
-            print(f"  Skipped: {svc_name} (no destination port)")
+            if svc.get("src_port"):
+                # Source-port-only services cannot be expressed by the
+                # importer (no <source-port> support) - fail closed.
+                print(f"  Skipped: {svc_name} (source-port-only service "
+                      f"cannot be expressed)")
+                warnings.append(
+                    f"Service object '{svc_name}': source-port restriction "
+                    f"cannot be migrated - review manually"
+                )
+            else:
+                print(f"  Skipped: {svc_name} (no destination port)")
             continue
-
-        sanitized = sanitize_name(svc_name)
-        sanitized = _dedup_name(sanitized, used_names)
 
         port_value = dst_port
         if svc.get("dst_port_end"):
             port_value = f"{dst_port}-{svc['dst_port_end']}"
 
-        results.append({
-            "name": sanitized,
-            "protocol": protocol,
-            "port": port_value,
-        })
-        print(f"  Converted: {svc_name} → {sanitized} "
-              f"[{protocol.upper()}] (port {port_value})")
+        if svc.get("src_port"):
+            warnings.append(
+                f"Service object '{svc_name}': source-port "
+                f"{svc['src_port']} not migrated (destination port kept)"
+            )
 
-    # Add ad-hoc service objects from inline ACL port specs
-    if inline_services:
-        for svc_name, svc_info in inline_services.items():
-            if svc_name in used_names:
-                continue
-            used_names.add(svc_name)
+        base = sanitize_name(svc_name)
+        protocols = _split_protocol(protocol)
+        emitted: List[str] = []
+        for proto in protocols:
+            name = base if len(protocols) == 1 else \
+                sanitize_name(f"{base}_{proto}")
+            name = _dedup_name(name, used_names)
             results.append({
-                "name": svc_name,
-                "protocol": svc_info["protocol"],
-                "port": svc_info["port"],
+                "name": name,
+                "protocol": proto,
+                "port": port_value,
             })
-            print(f"  Auto-created: {svc_name} [{svc_info['protocol'].upper()}] "
-                  f"(port {svc_info['port']})")
+            emitted.append(name)
+            print(f"  Converted: {svc_name} -> {name} "
+                  f"[{proto.upper()}] (port {port_value})")
+        svc_map[svc_name] = emitted
 
-    return results
+    return results, svc_map, used_names
+
+
+def append_inline_service_objects(
+    results: List[Dict],
+    inline_services: Dict[str, Dict],
+    used_names: Set[str],
+) -> None:
+    """Append ad-hoc service objects created from inline ACL port specs."""
+    for svc_name, svc_info in inline_services.items():
+        if svc_name in used_names:
+            continue
+        used_names.add(svc_name)
+        results.append({
+            "name": svc_name,
+            "protocol": svc_info["protocol"],
+            "port": svc_info["port"],
+        })
+        print(f"  Auto-created: {svc_name} [{svc_info['protocol'].upper()}] "
+              f"(port {svc_info['port']})")
 
 
 def convert_service_groups(
     parsed: Dict[str, Any],
     inline_services: Dict[str, Dict],
+    svc_map: Dict[str, List[str]],
+    used_names: Set[str],
+    warnings: List[str],
 ) -> List[Dict]:
     """Convert ASA service object-groups to PAN-OS service groups.
 
     For port-based groups (object-group service <name> tcp), each member
     port becomes an individual PAN-OS service object, and the group
-    references them.
+    references them. 'tcp-udp' members split into a tcp and a udp service
+    (PAN-OS has no tcp-udp protocol). Members that reference skipped
+    services or unsupported group types are dropped with a warning instead
+    of emitting dangling references. Groups register themselves in svc_map.
     """
     results: List[Dict] = []
-    used_names: Set[str] = set()
+
+    def _add_inline(proto: str, port_val: str) -> None:
+        for p in _split_protocol(proto):
+            svc_obj_name = sanitize_name(f"{p}_{port_val}")
+            if svc_obj_name not in inline_services:
+                inline_services[svc_obj_name] = {
+                    "protocol": p,
+                    "port": port_val,
+                }
+            member_names.append(svc_obj_name)
 
     for grp_name, grp in parsed["service_object_groups"].items():
         sanitized = sanitize_name(grp_name)
         sanitized = _dedup_name(sanitized, used_names)
-        protocol = grp.get("protocol", "tcp")
+        protocol = grp.get("protocol") or "tcp"
         port_members = grp.get("members", [])
         svc_refs = grp.get("service_refs", [])
 
@@ -337,30 +433,37 @@ def convert_service_groups(
 
         # Create service objects for each port in the group
         for port_val in port_members:
-            svc_obj_name = sanitize_name(f"{protocol}_{port_val}")
-            if svc_obj_name not in inline_services:
-                inline_services[svc_obj_name] = {
-                    "protocol": protocol,
-                    "port": port_val,
-                }
-            member_names.append(svc_obj_name)
+            _add_inline(protocol, port_val)
 
         # Handle service-object and group-object references
         for ref in svc_refs:
-            if ref["type"] == "object":
-                member_names.append(sanitize_name(ref["name"]))
-            elif ref["type"] == "group":
-                member_names.append(sanitize_name(ref["name"]))
+            if ref["type"] in ("object", "group"):
+                ref_name = ref["name"]
+                mapped = svc_map.get(ref_name)
+                if mapped is None:
+                    reason = "was not converted"
+                    if ref_name in parsed.get("icmp_type_groups", {}):
+                        reason = "is an icmp-type group (unsupported)"
+                    elif ref_name in parsed.get("protocol_groups", {}):
+                        reason = "is a protocol group (unsupported)"
+                    warnings.append(
+                        f"Service group '{grp_name}': member '{ref_name}' "
+                        f"{reason} - member dropped, review manually"
+                    )
+                    print(f"  WARNING: {grp_name}: unresolved member "
+                          f"'{ref_name}' dropped")
+                    continue
+                member_names.extend(mapped)
             elif ref["type"] == "inline":
-                proto = ref.get("protocol", "tcp")
-                port = ref.get("port", "")
-                svc_obj_name = sanitize_name(f"{proto}_{port}")
-                if svc_obj_name not in inline_services:
-                    inline_services[svc_obj_name] = {
-                        "protocol": proto,
-                        "port": port,
-                    }
-                member_names.append(svc_obj_name)
+                _add_inline(ref.get("protocol", "tcp"), ref.get("port", ""))
+            elif ref["type"] == "protocol":
+                # e.g. 'service-object icmp' - no PAN-OS service equivalent
+                warnings.append(
+                    f"Service group '{grp_name}': protocol-only member "
+                    f"'{ref.get('protocol', '')}' dropped - review manually"
+                )
+                print(f"  WARNING: {grp_name}: protocol-only member "
+                      f"'{ref.get('protocol', '')}' dropped")
 
         if not member_names:
             print(f"  Skipped: {grp_name} (no resolvable members)")
@@ -370,7 +473,8 @@ def convert_service_groups(
             "name": sanitized,
             "members": member_names,
         })
-        print(f"  Converted: {grp_name} → {sanitized} "
+        svc_map[grp_name] = [sanitized]
+        print(f"  Converted: {grp_name} -> {sanitized} "
               f"({len(member_names)} members)")
 
     return results
@@ -417,10 +521,48 @@ def convert_static_routes(
         results.append(pa_route)
         gw_display = gateway if gateway else "connected"
         intf_display = pa_intf if pa_intf else asa_intf
-        print(f"  Converted: {route_name} → {dest_cidr} via {gw_display} "
+        print(f"  Converted: {route_name} -> {dest_cidr} via {gw_display} "
               f"{intf_display} (metric {metric})")
 
     return results
+
+
+def _acl_zone_contexts(
+    bindings: List[Dict[str, str]],
+    zone_map: Dict[str, str],
+) -> List[Tuple[List[str], List[str], str, str]]:
+    """Build (from_zones, to_zones, name_suffix, note) contexts for an ACL.
+
+    'in' bindings match traffic entering the interface (from = zone),
+    'out' bindings match traffic leaving it (to = zone, zones swapped),
+    'global' applies everywhere (from/to any).
+    """
+    in_zones: List[str] = []
+    out_zones: List[str] = []
+    has_global = False
+    for b in bindings:
+        zone = zone_map.get(b.get("interface", ""),
+                            sanitize_name(b.get("interface", "")))
+        direction = b.get("direction", "in")
+        if direction == "global":
+            has_global = True
+        elif direction == "out":
+            out_zones.append(zone)
+        else:
+            in_zones.append(zone)
+
+    contexts: List[Tuple[List[str], List[str], str, str]] = []
+    if in_zones:
+        contexts.append((in_zones, ["any"], "", ""))
+    if out_zones:
+        contexts.append((["any"], out_zones, "_out",
+                         "ASA 'out' binding: matched on egress zone"))
+    if has_global:
+        contexts.append((["any"], ["any"], "_global",
+                         "ASA global access-group binding"))
+    if not contexts:
+        contexts.append((["any"], ["any"], "", ""))
+    return contexts
 
 
 def convert_security_rules(
@@ -428,79 +570,98 @@ def convert_security_rules(
     zone_map: Dict[str, str],
     inline_hosts: Dict[str, str],
     inline_services: Dict[str, Dict],
+    addr_map: Dict[str, str],
+    svc_map: Dict[str, List[str]],
+    warnings: List[str],
 ) -> List[Dict]:
     """Convert ASA access-lists to PAN-OS security rules.
 
-    Uses access-group bindings to determine the from-zone for each ACL.
+    Uses access-group bindings to determine the from/to zones for each ACL.
+    Fail-closed policy: an ACE whose service/protocol restriction cannot be
+    expressed in PAN-OS is emitted with disabled=yes and a description note
+    instead of silently becoming a service=any/application=any rule.
     """
     results: List[Dict] = []
     used_names: Set[str] = set()
     access_groups = parsed.get("access_groups", {})
 
     for acl_name, aces in parsed.get("access_lists", {}).items():
-        # Determine the interface / zone this ACL is bound to
-        binding = access_groups.get(acl_name)
-        from_zone = ""
-        if binding:
-            asa_intf = binding.get("interface", "")
-            from_zone = zone_map.get(asa_intf, sanitize_name(asa_intf))
+        contexts = _acl_zone_contexts(
+            access_groups.get(acl_name, []), zone_map
+        )
 
         for idx, ace in enumerate(aces, start=1):
             action = ace.get("action", "deny")
             pa_action = "allow" if action == "permit" else "deny"
 
-            # Rule name
-            base_name = f"{sanitize_name(acl_name)}_rule_{idx}"
-            rule_name = _dedup_name(base_name, used_names)
-
-            # Zones
-            from_zones = [from_zone] if from_zone else ["any"]
-            to_zones = ["any"]
-
-            # Source
+            # Source / destination
             sources = _resolve_ace_address(
-                ace.get("source", {}), inline_hosts, parsed
-            )
-            if not sources:
-                sources = ["any"]
-
-            # Destination
+                ace.get("source", {}), inline_hosts, addr_map, warnings
+            ) or ["any"]
             destinations = _resolve_ace_address(
-                ace.get("destination", {}), inline_hosts, parsed
+                ace.get("destination", {}), inline_hosts, addr_map, warnings
+            ) or ["any"]
+
+            # Service / application (may force the rule disabled)
+            services, applications, notes, disabled_reason = (
+                _resolve_ace_service(ace, parsed, inline_services, svc_map)
             )
-            if not destinations:
-                destinations = ["any"]
+            for note in notes:
+                warnings.append(f"ACL {acl_name} entry {idx}: {note}")
 
-            # Service
-            services = _resolve_ace_service(
-                ace, parsed, inline_services
+            disabled = "no"
+            if ace.get("inactive"):
+                # ASA 'inactive' ACEs stay disabled on PAN-OS
+                disabled = "yes"
+                notes = notes + ["ASA inactive ACE"]
+            if disabled_reason:
+                disabled = "yes"
+                notes = notes + [f"DISABLED for review: {disabled_reason}"]
+                warnings.append(
+                    f"ACL {acl_name} entry {idx}: {disabled_reason} - "
+                    f"rule emitted disabled"
+                )
+            if ace.get("time_range"):
+                notes = notes + [
+                    f"ASA time-range '{ace['time_range']}' not migrated"
+                ]
+                warnings.append(
+                    f"ACL {acl_name} entry {idx}: time-range "
+                    f"'{ace['time_range']}' not migrated - review schedule"
+                )
+
+            description = " ".join(
+                [f"ASA ACL: {acl_name}"] + [f"({n})" for n in notes]
             )
-            if not services:
-                services = ["any"]
 
-            # Description
-            protocol = ace.get("protocol", "")
-            desc_parts = [f"ASA ACL: {acl_name}"]
-            if protocol == "icmp":
-                desc_parts.append("(ICMP - review application setting)")
-            description = " ".join(desc_parts)
+            # ASA logs permits only when 'log' is set; denies are logged
+            # by default (syslog 106023)
+            log_end = "yes" if (ace.get("log") or pa_action == "deny") \
+                else "no"
 
-            rule: Dict[str, Any] = {
-                "name": rule_name,
-                "from_zones": from_zones,
-                "to_zones": to_zones,
-                "sources": sources,
-                "destinations": destinations,
-                "services": services,
-                "application": ["any"],
-                "action": pa_action,
-                "log_end": "yes",
-                "description": description,
-                "disabled": "no",
-            }
-            results.append(rule)
-            print(f"  Converted: {rule_name} [{pa_action.upper()}] "
-                  f"({', '.join(from_zones)} → {', '.join(to_zones)})")
+            for from_zones, to_zones, suffix, ctx_note in contexts:
+                base_name = f"{sanitize_name(acl_name)}_rule_{idx}{suffix}"
+                rule_name = _dedup_name(base_name, used_names)
+                rule_desc = (f"{description} ({ctx_note})" if ctx_note
+                             else description)
+
+                rule: Dict[str, Any] = {
+                    "name": rule_name,
+                    "from_zones": from_zones,
+                    "to_zones": to_zones,
+                    "sources": sources,
+                    "destinations": destinations,
+                    "services": services,
+                    "application": applications,
+                    "action": pa_action,
+                    "log_end": log_end,
+                    "description": rule_desc,
+                    "disabled": disabled,
+                }
+                results.append(rule)
+                print(f"  Converted: {rule_name} [{pa_action.upper()}] "
+                      f"({', '.join(from_zones)} -> {', '.join(to_zones)})"
+                      + (" [DISABLED]" if disabled == "yes" else ""))
 
     return results
 
@@ -512,7 +673,8 @@ def convert_security_rules(
 def _resolve_ace_address(
     addr_spec: Dict[str, str],
     inline_hosts: Dict[str, str],
-    parsed: Dict[str, Any],
+    addr_map: Dict[str, str],
+    warnings: List[str],
 ) -> List[str]:
     """Resolve an ACE address specifier to PAN-OS address reference(s)."""
     addr_type = addr_spec.get("type", "any")
@@ -524,10 +686,18 @@ def _resolve_ace_address(
         host_name = sanitize_name(f"host_{ip.replace('.', '_')}")
         inline_hosts[host_name] = ip
         return [host_name]
-    elif addr_type == "object":
-        return [sanitize_name(addr_spec.get("name", ""))]
-    elif addr_type == "object-group":
-        return [sanitize_name(addr_spec.get("name", ""))]
+    elif addr_type in ("object", "object-group"):
+        ref = addr_spec.get("name", "")
+        mapped = addr_map.get(ref)
+        if mapped is None:
+            # Keep a sanitized reference (import fails loudly on a missing
+            # object rather than silently matching 'any')
+            warnings.append(
+                f"Address reference '{ref}' was not converted - rule "
+                f"references it anyway, review manually"
+            )
+            return [sanitize_name(ref)]
+        return [mapped]
     elif addr_type == "subnet":
         ip = addr_spec.get("value", "")
         mask = addr_spec.get("netmask", "")
@@ -543,95 +713,159 @@ def _resolve_ace_service(
     ace: Dict[str, Any],
     parsed: Dict[str, Any],
     inline_services: Dict[str, Dict],
-) -> List[str]:
-    """Resolve the service/port from an ACE to PAN-OS service reference(s)."""
+    svc_map: Dict[str, List[str]],
+) -> Tuple[List[str], List[str], List[str], str]:
+    """Resolve the service/application for an ACE.
+
+    Returns (services, applications, notes, disabled_reason). A non-empty
+    disabled_reason means the restriction cannot be expressed in PAN-OS and
+    the rule must be emitted disabled (fail closed) rather than silently
+    broadened to service=any/application=any.
+    """
     protocol = ace.get("protocol", "")
+    notes: List[str] = []
 
-    # Protocol is a service object or group reference
+    # Protocol position held a service object / group reference
     if ace.get("protocol_ref_type") in ("object", "object-group"):
-        return [sanitize_name(ace["protocol_ref_name"])]
+        ref = ace.get("protocol_ref_name") or ""
+        mapped = svc_map.get(ref)
+        if mapped:
+            return mapped, ["any"], notes, ""
+        if ref in parsed.get("protocol_groups", {}):
+            reason = (f"protocol object-group '{ref}' cannot be expressed "
+                      f"as a PAN-OS service")
+        elif ref in parsed.get("icmp_type_groups", {}):
+            reason = (f"icmp-type object-group '{ref}' cannot be expressed "
+                      f"as a PAN-OS service")
+        else:
+            reason = f"service reference '{ref}' was not converted"
+        return ["any"], ["any"], notes, reason
 
-    # IP = any protocol → PAN-OS "any"
+    # 'ip' matches any protocol - service any / application any is faithful
     if protocol in ("ip", ""):
-        return ["any"]
+        return ["any"], ["any"], notes, ""
 
-    # ICMP - no port-based service object
-    if protocol in ("icmp", "icmp6"):
-        return ["any"]
+    # ICMP: PAN-OS models this with App-IDs, not services. 'icmp' covers
+    # non-echo types, 'ping' covers echo request/reply.
+    if protocol == "icmp":
+        return ["application-default"], ["icmp", "ping"], notes, ""
+    if protocol == "icmp6":
+        return ["application-default"], ["ipv6-icmp"], notes, ""
 
-    # TCP / UDP with destination port
-    dest_port = ace.get("dest_port")
-    if dest_port:
-        return _resolve_port_spec(dest_port, protocol, inline_services)
+    if protocol in ("tcp", "udp"):
+        dest_port = ace.get("dest_port")
+        if ace.get("source_port"):
+            # The importer's service schema has no source-port field
+            notes.append("ASA source-port restriction not migrated - "
+                         "review manually")
+        if dest_port:
+            services = _resolve_port_spec(
+                dest_port, protocol, inline_services, svc_map
+            )
+            if services is None:
+                return (["any"], ["any"], notes,
+                        f"{protocol} port restriction "
+                        f"'{dest_port.get('type', '')} "
+                        f"{dest_port.get('port', '')}' cannot be expressed")
+            return services, ["any"], notes, ""
+        # tcp/udp without ports: PAN-OS has no protocol-only service object.
+        # Disabling every such rule would be too disruptive, so keep
+        # service=any but flag it for review (documented trade-off).
+        notes.append(f"ASA restricted protocol to {protocol}; PAN-OS "
+                     f"service left 'any' - review manually")
+        return ["any"], ["any"], notes, ""
 
-    # TCP / UDP without port → any
-    return ["any"]
+    # Other IP protocols (gre, esp, ospf, protocol numbers, ...) have no
+    # service equivalent - fail closed instead of allowing everything.
+    return (["any"], ["any"], notes,
+            f"IP protocol '{protocol}' cannot be expressed as a "
+            f"PAN-OS service")
 
 
 def _resolve_port_spec(
     port_spec: Dict[str, str],
     protocol: str,
     inline_services: Dict[str, Dict],
-) -> List[str]:
-    """Resolve a port specification to PAN-OS service object name(s)."""
+    svc_map: Dict[str, List[str]],
+) -> Optional[List[str]]:
+    """Resolve a port specification to PAN-OS service object name(s).
+
+    Returns None when the specification cannot be expressed (caller emits
+    the rule disabled - fail closed).
+    """
     ptype = port_spec.get("type", "")
 
+    if ptype == "object-group":
+        return svc_map.get(port_spec.get("name", ""))
+
     if ptype == "eq":
-        port = port_spec.get("port", "")
-        svc_name = sanitize_name(f"{protocol}_{port}")
-        if svc_name not in inline_services:
-            inline_services[svc_name] = {
-                "protocol": protocol,
-                "port": port,
-            }
-        return [svc_name]
+        port_val = port_spec.get("port", "")
+        base = f"{protocol}_{port_val}"
     elif ptype == "range":
         start = port_spec.get("start", "")
         end = port_spec.get("end", "")
         port_val = f"{start}-{end}"
-        svc_name = sanitize_name(f"{protocol}_{start}_{end}")
-        if svc_name not in inline_services:
-            inline_services[svc_name] = {
-                "protocol": protocol,
-                "port": port_val,
-            }
-        return [svc_name]
-    elif ptype == "object-group":
-        return [sanitize_name(port_spec.get("name", ""))]
+        base = f"{protocol}_{start}_{end}"
     elif ptype in ("gt", "lt", "neq"):
         port = port_spec.get("port", "")
+        if not port.isdigit():
+            return None
+        p = int(port)
         if ptype == "gt":
-            port_val = f"{int(port) + 1}-65535" if port.isdigit() else port
+            # gt 65535 matches nothing - inexpressible, fail closed
+            if p >= 65535:
+                return None
+            port_val = f"{p + 1}-65535"
         elif ptype == "lt":
-            port_val = f"1-{int(port) - 1}" if port.isdigit() else port
+            # lt 0 matches nothing; lt starts at port 0
+            if p <= 0:
+                return None
+            port_val = "0" if p == 1 else f"0-{p - 1}"
         else:
-            port_val = port  # neq - approximate
-        svc_name = sanitize_name(f"{protocol}_{ptype}_{port}")
-        if svc_name not in inline_services:
-            inline_services[svc_name] = {
-                "protocol": protocol,
-                "port": port_val,
-            }
-        return [svc_name]
+            # neq p = everything except p, as a comma-separated port list
+            if p <= 0:
+                port_val = "1-65535"
+            elif p >= 65535:
+                port_val = "0-65534"
+            else:
+                port_val = f"0-{p - 1},{p + 1}-65535"
+        base = f"{protocol}_{ptype}_{port}"
+    else:
+        return None
 
-    return ["any"]
+    svc_name = sanitize_name(base)
+    if svc_name not in inline_services:
+        inline_services[svc_name] = {
+            "protocol": protocol,
+            "port": port_val,
+        }
+    return [svc_name]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+_PA_NAME_MAX = 63
+
+
 def _dedup_name(name: str, used: Set[str]) -> str:
-    """Return a unique name by appending _N if already used."""
+    """Return a unique name by appending _N if already used.
+
+    The base is trimmed so the suffixed name stays within the PAN-OS
+    63-character limit.
+    """
     if name not in used:
         used.add(name)
         return name
     counter = 2
-    while f"{name}_{counter}" in used:
+    while True:
+        suffix = f"_{counter}"
+        unique = f"{name[:_PA_NAME_MAX - len(suffix)]}{suffix}"
+        if unique not in used:
+            used.add(unique)
+            return unique
         counter += 1
-    unique = f"{name}_{counter}"
-    used.add(unique)
-    return unique
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -708,6 +942,16 @@ Examples:
     except FileNotFoundError:
         print(f"\n[ERROR] Input file '{args.input_file}' not found!")
         return 1
+    except UnicodeDecodeError:
+        print("  WARNING: input is not valid UTF-8; re-reading with "
+              "undecodable bytes replaced")
+        try:
+            with open(args.input_file, "r", encoding="utf-8",
+                      errors="replace") as f:
+                config_text = f.read()
+        except OSError as e:
+            print(f"\n[ERROR] Could not read input file: {e}")
+            return 1
     except OSError as e:
         print(f"\n[ERROR] Could not read input file: {e}")
         return 1
@@ -729,8 +973,9 @@ Examples:
     print(f"  - NAT rules: {len(parsed['nat_rules'])}")
 
     # Shared containers for ad-hoc objects created during conversion
-    inline_hosts: Dict[str, str] = {}       # name → IP or CIDR
-    inline_services: Dict[str, Dict] = {}   # name → {protocol, port}
+    inline_hosts: Dict[str, str] = {}       # name -> IP or CIDR
+    inline_services: Dict[str, Dict] = {}   # name -> {protocol, port}
+    warnings: List[str] = []                # manual-review notes
 
     # ====================================================================
     # Convert interfaces & zones
@@ -746,23 +991,42 @@ Examples:
           f"{len(pa_zones)} zones created")
 
     # ====================================================================
-    # Convert address groups FIRST (to discover inline host objects)
+    # Convert named address / service objects FIRST so their emitted
+    # (possibly renamed) names are known to every later reference
+    # ====================================================================
+    print("\n" + "-" * 60)
+    print("Converting Address Objects...")
+    print("-" * 60)
+
+    address_objects, addr_map, addr_used = convert_address_objects(parsed)
+
+    print("\n" + "-" * 60)
+    print("Converting Service Objects...")
+    print("-" * 60)
+
+    service_objects, svc_map, svc_used = convert_service_objects(
+        parsed, warnings
+    )
+
+    # ====================================================================
+    # Convert groups (discover inline objects, register group names)
     # ====================================================================
     print("\n" + "-" * 60)
     print("Converting Address Groups...")
     print("-" * 60)
 
-    address_groups = convert_address_groups(parsed, inline_hosts)
+    address_groups = convert_address_groups(
+        parsed, inline_hosts, addr_map, addr_used, warnings
+    )
     print(f"[OK] Converted {len(address_groups)} address groups")
 
-    # ====================================================================
-    # Convert service groups (to discover inline service objects)
-    # ====================================================================
     print("\n" + "-" * 60)
     print("Converting Service Groups...")
     print("-" * 60)
 
-    service_groups = convert_service_groups(parsed, inline_services)
+    service_groups = convert_service_groups(
+        parsed, inline_services, svc_map, svc_used, warnings
+    )
     print(f"[OK] Converted {len(service_groups)} service groups")
 
     # ====================================================================
@@ -773,36 +1037,34 @@ Examples:
     print("-" * 60)
 
     security_rules = convert_security_rules(
-        parsed, zone_map, inline_hosts, inline_services
+        parsed, zone_map, inline_hosts, inline_services,
+        addr_map, svc_map, warnings
     )
 
     allow_count = sum(1 for r in security_rules if r["action"] == "allow")
     deny_count = len(security_rules) - allow_count
+    disabled_count = sum(
+        1 for r in security_rules if r["disabled"] == "yes"
+    )
     print(f"[OK] Converted {len(security_rules)} security rules "
-          f"(allow: {allow_count}, deny: {deny_count})")
+          f"(allow: {allow_count}, deny: {deny_count}, "
+          f"disabled: {disabled_count})")
 
     # ====================================================================
-    # Convert address objects (including inline hosts discovered above)
-    # ====================================================================
-    print("\n" + "-" * 60)
-    print("Converting Address Objects...")
-    print("-" * 60)
-
-    address_objects = convert_address_objects(parsed, inline_hosts)
-    print(f"[OK] Converted {len(address_objects)} address objects")
-
-    # ====================================================================
-    # Convert service objects (including inline services discovered above)
+    # Append inline objects discovered during group / rule conversion
     # ====================================================================
     print("\n" + "-" * 60)
-    print("Converting Service Objects...")
+    print("Appending inline objects...")
     print("-" * 60)
 
-    service_objects = convert_service_objects(parsed, inline_services)
+    append_inline_address_objects(address_objects, inline_hosts, addr_used)
+    print(f"[OK] {len(address_objects)} address objects total")
+
+    append_inline_service_objects(service_objects, inline_services, svc_used)
 
     tcp_count = sum(1 for s in service_objects if s.get("protocol") == "tcp")
     udp_count = sum(1 for s in service_objects if s.get("protocol") == "udp")
-    print(f"[OK] Converted {len(service_objects)} service objects "
+    print(f"[OK] {len(service_objects)} service objects total "
           f"(TCP: {tcp_count}, UDP: {udp_count})")
 
     # ====================================================================
@@ -843,10 +1105,11 @@ Examples:
         "output_basename": args.output,
         "schema_version": 1,
     }
-    write_json_file(f"{base}_metadata.json", metadata, pretty=args.pretty)
-    print(f"[OK] Wrote metadata: {base}_metadata.json")
 
     try:
+        write_json_file(f"{base}_metadata.json", metadata, pretty=args.pretty)
+        print(f"[OK] Wrote metadata: {base}_metadata.json")
+
         for label, (path, data) in file_map.items():
             write_json_file(path, data, args.pretty)
             print(f"[OK] {label}: {path} ({len(data)} items)")
@@ -884,10 +1147,13 @@ Examples:
                     "total": len(security_rules),
                     "allow": allow_count,
                     "deny": deny_count,
+                    "disabled_for_review": disabled_count,
                 },
                 "static_routes": len(static_routes),
                 "nat_rules_for_review": len(nat_rules),
+                "skipped_acl_lines": parsed.get("skipped_acl_lines", []),
             },
+            "warnings": warnings,
         }
         write_json_file(f"{base}_summary.json", summary, pretty=True)
         print(f"[OK] Summary: {base}_summary.json")
@@ -919,6 +1185,20 @@ Examples:
               f"{base}_nat_rules.json")
         print("        NAT requires manual review - PAN-OS NAT differs "
               "significantly from ASA.")
+
+    skipped_acl = parsed.get("skipped_acl_lines", [])
+    if warnings or skipped_acl:
+        print("\n" + "=" * 60)
+        print(f"MANUAL REVIEW REQUIRED "
+              f"({len(warnings)} warning(s), "
+              f"{len(skipped_acl)} skipped ACL line(s))")
+        print("=" * 60)
+        for w in warnings:
+            print(f"  - {w}")
+        for entry in skipped_acl:
+            print(f"  - Skipped ACL line ({entry['reason']}): "
+                  f"{entry['line']}")
+        print(f"  (also saved in {base}_summary.json)")
 
     print("\n" + "=" * 60)
     print("IMPORT ORDER FOR PAN-OS:")

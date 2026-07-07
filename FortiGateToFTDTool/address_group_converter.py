@@ -39,15 +39,15 @@ IMPORTANT NOTES:
     - The 'type' is always 'networkobject' for address group members
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 
-from common import sanitize_name, build_group_lookup, flatten_group_members
+from common import sanitize_name, build_group_lookup, flatten_group_members, first_item, dedupe_name
 
 
 class AddressGroupConverter:
     """
     Converter class for transforming FortiGate address groups to FTD network groups.
-    
+
     This class is responsible for:
     1. Reading the 'firewall_addrgrp' section from FortiGate YAML
     2. Extracting group names and their member objects
@@ -55,27 +55,43 @@ class AddressGroupConverter:
     4. Converting to FTD's networkobjectgroup format
     5. Handling edge cases (empty groups, single vs multiple members)
     """
-    
-    def __init__(self, fortigate_config: Dict[str, Any], address_object_names: Optional[set] = None) -> None:
+
+    def __init__(self, fortigate_config: Dict[str, Any],
+                 address_name_mapping: Optional[Dict[str, str]] = None,
+                 skipped_addresses: Optional[Set[str]] = None) -> None:
         """
         Initialize the converter with FortiGate configuration data.
-        
+
         Args:
             fortigate_config: Dictionary containing the complete parsed FortiGate YAML
                              Expected to have a 'firewall_addrgrp' key with group data
-            address_object_names: Set of address object names (to distinguish objects from groups)
+            address_name_mapping: Dict from AddressConverter mapping original
+                             sanitized address names to final FTD object names.
+                             When provided, members are remapped through it and
+                             members without a converted object are dropped.
+            skipped_addresses: Sanitized names of addresses the AddressConverter
+                             did not convert (defaults, invalid, ...) - these
+                             are filtered out of groups.
         """
         # Store the entire FortiGate configuration
         # We'll extract what we need from this in the convert() method
         self.fg_config = fortigate_config
-        
-        # Set of known address object names (not groups)
-        self.address_object_names = address_object_names or set()
-        
+
+        # Address rename map / skip set from the AddressConverter
+        self.address_name_mapping = address_name_mapping or {}
+        self.skipped_addresses = skipped_addresses or set()
+
         # This will store the converted FTD network groups
         # Starts empty and gets populated by the convert() method
         self.ftd_network_groups = []
-        
+
+        # Mapping of original sanitized group name -> final FTD group name
+        # (differs when a sanitization collision forced an X_2 rename).
+        self.group_name_mapping: Dict[str, str] = {}
+
+        # Track items that failed/were skipped during conversion
+        self.failed_items = []
+
         # Build a lookup of group name -> member list for flattening nested groups
         self.group_members = build_group_lookup(
             self.fg_config.get('firewall_addrgrp', [])
@@ -119,23 +135,19 @@ class AddressGroupConverter:
         # ====================================================================
         for group_dict in address_groups:
             # ================================================================
-            # STEP 2A: Extract the group name
+            # STEP 2A/2B: Extract the group name and properties
             # ================================================================
-            group_name = list(group_dict.keys())[0]
-            sanitized_group_name = sanitize_name(group_name)
+            item = first_item(group_dict)
+            if item is None:
+                print("  Skipped: empty/malformed address group entry")
+                continue
+            group_name, properties = item
+            base_group_name = sanitize_name(group_name)
 
             # Deduplicate: if this name was already used, append _2, _3, etc.
-            if sanitized_group_name in used_names:
-                used_names[sanitized_group_name] += 1
-                sanitized_group_name = f"{sanitized_group_name}_{used_names[sanitized_group_name]}"
-            else:
-                used_names[sanitized_group_name] = 1
+            # (generated names are registered so a literal X_2 can't collide)
+            sanitized_group_name = dedupe_name(base_group_name, used_names)
 
-            # ================================================================
-            # STEP 2B: Extract the group properties
-            # ================================================================
-            properties = group_dict[group_name]
-            
             # ================================================================
             # STEP 2C: Extract and normalize the member list
             # ================================================================
@@ -156,31 +168,63 @@ class AddressGroupConverter:
             # FTD does NOT allow groups inside groups, so we need to expand
             # any nested groups into their individual objects
             flattened_members = flatten_group_members(members_list, self.group_members)
-            
+
             # ================================================================
             # STEP 2E: Convert members to FTD object format
             # ================================================================
+            # Filter out members the AddressConverter did not convert (factory
+            # defaults, invalid objects) and follow collision renames - a
+            # verbatim member would be a dangling reference on FDM import.
             ftd_members = []
+            seen_members = set()
             for member_name in flattened_members:
+                if member_name in self.skipped_addresses:
+                    print(f"    Filtered out: {member_name} (address not migrated)")
+                    continue
+                if self.address_name_mapping:
+                    final_name = self.address_name_mapping.get(member_name)
+                    if final_name is None:
+                        print(f"    Filtered out: {member_name} (no converted address object)")
+                        continue
+                else:
+                    # No mapping supplied (standalone use) - keep legacy behavior
+                    final_name = member_name
+                if final_name in seen_members:
+                    continue
+                seen_members.add(final_name)
                 member_obj = {
-                    "name": member_name,
+                    "name": final_name,
                     "type": "networkobject"
                 }
                 ftd_members.append(member_obj)
-            
+
             # ================================================================
             # STEP 2F: Create the FTD network group structure
             # ================================================================
+            # FDM rejects groups with no members - skip instead of exporting
+            if not ftd_members:
+                print(f"  Skipped: {group_name} (empty group - no valid members)")
+                self.failed_items.append({
+                    "name": str(group_name),
+                    "reason": "empty group - no members were converted",
+                    "config": properties,
+                })
+                continue
+
+            # Record the rename so policies referencing the original name can
+            # follow it to the final group (first occurrence wins).
+            self.group_name_mapping.setdefault(base_group_name, sanitized_group_name)
+
             ftd_group = {
                 "name": sanitized_group_name,
                 "isSystemDefined": False,
                 "objects": ftd_members,
                 "type": "networkobjectgroup"
             }
-            
+
             # Add the converted group to our result list
             network_groups.append(ftd_group)
-            
+
             # ================================================================
             # STEP 2G: Print conversion details for user feedback
             # ================================================================
@@ -207,11 +251,15 @@ class AddressGroupConverter:
     def get_group_count(self) -> int:
         """
         Get the number of address groups that were converted.
-        
+
         Returns:
             Integer count of converted groups
         """
         return len(self.ftd_network_groups)
+
+    def get_group_name_mapping(self) -> Dict[str, str]:
+        """Return {original sanitized group name: final FTD group name}."""
+        return self.group_name_mapping
     
     def get_member_count(self, group_name: str) -> int:
         """

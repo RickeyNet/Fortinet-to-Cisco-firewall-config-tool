@@ -78,16 +78,26 @@ class FTDBulkDelete(FTDBaseClient):
             "failed": 0
         }
 
+        # Phases that failed outright without producing per-item stats
+        # (e.g. the object listing itself failed, or was truncated at the
+        # safety cap). compute_outcome treats a non-empty list as a failed
+        # run even when the item counters show no failures.
+        self.phase_failures: List[str] = []
+
+    def record_phase_failure(self, label: str) -> None:
+        """Record a phase that failed outright (e.g. listing failed)."""
+        self.phase_failures.append(label)
+
     def compute_outcome(self) -> tuple:
-        """Determine overall run outcome from cumulative stats.
+        """Determine overall run outcome from cumulative stats and phase failures.
 
         Returns:
             (exit_code, outcome_label) where:
-                0, "SUCCESS"         - every item succeeded
-                2, "PARTIAL_FAILURE" - at least one item failed but some succeeded
-                3, "ALL_FAILED"      - every attempted item failed
+                0, "SUCCESS"         - every item/phase succeeded
+                2, "PARTIAL_FAILURE" - at least one item/phase failed but some succeeded
+                3, "ALL_FAILED"      - every attempted item/phase failed
         """
-        if self.stats["failed"] == 0:
+        if self.stats["failed"] == 0 and not self.phase_failures:
             return 0, "SUCCESS"
         if self.stats["deleted"] > 0:
             return 2, "PARTIAL_FAILURE"
@@ -103,43 +113,40 @@ class FTDBulkDelete(FTDBaseClient):
         except (OSError, TypeError, ValueError):
             return False
     
-    def get_all_objects(self, endpoint: str) -> List[Dict]:
+    def get_all_objects(self, endpoint: str) -> Optional[List[Dict]]:
         """
         Retrieve ALL objects from FTD endpoint with pagination.
-        
+
         Args:
             endpoint: API endpoint path
-            
+
         Returns:
-            List of all objects
+            List of all objects (possibly empty), or None when the listing
+            failed - callers must treat None as a failed phase instead of
+            "no objects found".
         """
         url = f"{self.base_url}{endpoint}"
-        all_items = []
+        all_items: List[Dict] = []
         offset = 0
         limit = 100
-        
+
+        # NOTE: 401 responses are handled transparently by the session-level
+        # auto-refresh hook (FTDBaseClient._auto_refresh_hook), so no manual
+        # token-refresh handling is needed here.
         try:
             print(f"  Fetching from {endpoint}...")
-            
+
             while True:
                 params = {"offset": offset, "limit": limit}
                 response = self.session.get(url, params=params, timeout=30)
-                
-                if response.status_code == 401:
-                    if self.refresh_access_token():
-                        # Retry this page with the new token.
-                        response = self.session.get(url, params=params, timeout=30)
-                    if response.status_code == 401:
-                        print("    Warning: HTTP 401 (token refresh failed)")
-                        break
 
                 if response.status_code == 200:
                     data = response.json()
                     items = data.get("items", [])
-                    
+
                     if self.debug:
                         print(f"    Retrieved {len(items)} objects (offset: {offset})")
-                    
+
                     # Debug: Show first object
                     if self.debug and items and offset == 0:
                         print("\n    [DEBUG] First object:")
@@ -147,21 +154,29 @@ class FTDBulkDelete(FTDBaseClient):
                         print(f"      ID: {items[0].get('id')}")
                         print(f"      Type: {items[0].get('type')}")
                         print(f"      isSystemDefined: {items[0].get('isSystemDefined')}\n")
-                    
+
                     if not items:
                         break
-                    
+
                     all_items.extend(items)
-                    offset += limit
-                    
+                    # Advance by the actual page size - a page may return
+                    # fewer than `limit` items and skipping would lose objects.
+                    offset += len(items)
+
                     # Check pagination
                     paging = data.get("paging", {})
                     if not paging.get("next"):
                         break
-                    
-                    # Safety limit
+
+                    # Safety limit - the listing is incomplete, so the phase
+                    # must not be reported as a clean success.
                     if offset > 10000:
-                        print(f"    Warning: Stopped at {offset} objects (safety limit)")
+                        print(f"    Warning: Stopped at {offset} objects (safety limit). "
+                              "The object list is INCOMPLETE - remaining objects were "
+                              "not fetched; this phase will be reported as failed/partial.")
+                        self.record_phase_failure(
+                            f"{endpoint}: listing truncated at {offset} objects (safety limit)"
+                        )
                         break
                 else:
                     print(f"    Warning: HTTP {response.status_code}")
@@ -175,14 +190,14 @@ class FTDBulkDelete(FTDBaseClient):
                                 print(f"    Response: {err}")
                         except (ValueError, TypeError, KeyError):
                             pass
-                    break
-            
+                    return None
+
             print(f"  Total retrieved: {len(all_items)} objects")
             return all_items
-            
+
         except requests.exceptions.RequestException as e:
             print(f"  Error: {e}")
-            return []
+            return None
 
     def delete_all_static_routes(self, dry_run: bool = False, max_workers: int = 1, max_attempts: int = 4, base_backoff: float = 0.3, max_jitter: float = 0.25) -> bool:
         """
@@ -212,6 +227,10 @@ class FTDBulkDelete(FTDBaseClient):
 
         # Fetch all routes under the VR
         routes = self.get_all_objects(endpoint)
+        if routes is None:
+            # Listing failed - do NOT report "no routes found" + success
+            print(f"  {flair('validate', 'FAIL', 'static route listing', 'could not retrieve routes')}")
+            return False
         if not routes:
             print("  No static routes found")
             return True
@@ -299,43 +318,38 @@ class FTDBulkDelete(FTDBaseClient):
             Tuple of (success: bool, error_message: str)
         """
         url = f"{self.base_url}{endpoint}/{object_id}"
-        
-        for attempt in range(2):  # one retry after a token refresh
-            try:
-                response = self.session.delete(url, timeout=30)
-                
-                if response.status_code == 401:
-                    if attempt == 0 and self.refresh_access_token():
-                        continue  # retry with the refreshed token
-                    return False, "HTTP 401"
 
-                if response.status_code in [200, 204]:
-                    return True, ""
-                elif response.status_code == 404:
-                    return True, "already deleted"  # Already gone
-                elif response.status_code == 422:
-                    # Unprocessable - get the actual error
-                    try:
-                        error_data = response.json()
-                        error_msg = error_data.get('error', {}).get('messages', [{}])[0].get('description', 'Unknown error')
-                        return False, error_msg
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        return False, f"HTTP 422: {response.text[:100]}"
-                elif response.status_code == 400:
-                    # Bad request - often means object is in use
-                    try:
-                        error_data = response.json()
-                        error_msg = error_data.get('error', {}).get('messages', [{}])[0].get('description', 'Unknown error')
-                        return False, error_msg
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        return False, f"HTTP 400: {response.text[:100]}"
-                else:
-                    return False, f"HTTP {response.status_code}"
-                    
-            except requests.exceptions.RequestException as e:
-                return False, str(e)
-        
-        return False, "HTTP 401"
+        # NOTE: 401 responses are handled transparently by the session-level
+        # auto-refresh hook (FTDBaseClient._auto_refresh_hook), which
+        # refreshes the token and retries once - no manual loop needed here.
+        try:
+            response = self.session.delete(url, timeout=30)
+
+            if response.status_code in [200, 204]:
+                return True, ""
+            elif response.status_code == 404:
+                return True, "already deleted"  # Already gone
+            elif response.status_code == 422:
+                # Unprocessable - get the actual error
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('error', {}).get('messages', [{}])[0].get('description', 'Unknown error')
+                    return False, error_msg
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return False, f"HTTP 422: {response.text[:100]}"
+            elif response.status_code == 400:
+                # Bad request - often means object is in use
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('error', {}).get('messages', [{}])[0].get('description', 'Unknown error')
+                    return False, error_msg
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return False, f"HTTP 400: {response.text[:100]}"
+            else:
+                return False, f"HTTP {response.status_code}"
+
+        except requests.exceptions.RequestException as e:
+            return False, str(e)
     
     def delete_all_custom_objects(
         self,
@@ -364,7 +378,12 @@ class FTDBulkDelete(FTDBaseClient):
         
         # Get ALL objects from FTD
         all_objects = self.get_all_objects(endpoint)
-        
+
+        if all_objects is None:
+            # Listing failed - do NOT report "no objects found" + success
+            print(f"  {flair('validate', 'FAIL', f'{object_type} listing', 'could not retrieve objects')}")
+            return False
+
         if not all_objects:
             print(f"  No {object_type.lower()} found in FTD")
             return True
@@ -443,11 +462,44 @@ class FTDBulkDelete(FTDBaseClient):
             with print_lock:
                 print(f"  [{idx+1}/{len(custom_objects)}] {flair('delete', 'FAIL', name, error_msg)}", flush=True)
                 counters["failed"] += 1
-                failed_objects.append((name, error_msg))
+                failed_objects.append((obj, error_msg))
             failure_flag[0] = True
             return
 
         run_indexed_thread_pool(max_workers=max_workers, items=custom_objects, worker=worker)
+
+        # Nested groups: a child group fails "in use" while a parent group
+        # still references it. Retry the failed deletions in additional
+        # passes until a pass makes no progress (bounded), then report the
+        # remainder as real failures.
+        if failed_objects and endpoint in ("/object/networkgroups", "/object/portgroups"):
+            max_passes = 10
+            for pass_num in range(1, max_passes + 1):
+                print(f"\n  Retry pass {pass_num}: {len(failed_objects)} group(s) "
+                      "failed (possibly nested) - retrying...")
+                remaining = []
+                progressed = False
+                for obj, _prev_err in failed_objects:
+                    name = obj.get('name', 'UNNAMED')
+                    obj_id = obj.get('id')
+                    ok, err = run_with_retry(
+                        lambda oid=obj_id: self.delete_object(endpoint, oid),
+                        max_attempts=max_attempts,
+                        base_backoff=base_backoff,
+                        max_jitter=max_jitter,
+                    )
+                    if ok:
+                        print(f"    {flair('delete', 'OK', name)}", flush=True)
+                        counters["deleted"] += 1
+                        counters["failed"] -= 1
+                        progressed = True
+                    else:
+                        remaining.append((obj, err))
+                failed_objects = remaining
+                if not failed_objects or not progressed:
+                    break
+            # Failures may have been recovered by the retry passes.
+            failure_flag[0] = counters["failed"] > 0
 
         self.stats["deleted"] += counters["deleted"]
         self.stats["failed"] += counters["failed"]
@@ -458,8 +510,8 @@ class FTDBulkDelete(FTDBaseClient):
 
         if failed_objects:
             print("\n  Failed objects:")
-            for name, error in failed_objects[:10]:
-                print(f"    - {name}: {error}")
+            for obj, error in failed_objects[:10]:
+                print(f"    - {obj.get('name', 'UNNAMED')}: {error}")
             if len(failed_objects) > 10:
                 print(f"    ... and {len(failed_objects) - 10} more")
 
@@ -676,7 +728,11 @@ class FTDBulkDelete(FTDBaseClient):
         
         # Get all interfaces
         all_interfaces = self.get_all_objects("/devices/default/interfaces")
-        
+
+        if all_interfaces is None:
+            print(f"  {flair('validate', 'FAIL', 'interface listing', 'could not retrieve interfaces')}")
+            return False
+
         if not all_interfaces:
             print("  No interfaces found")
             return True
@@ -753,65 +809,72 @@ class FTDBulkDelete(FTDBaseClient):
 
         return fail_count == 0
     
-    def get_all_subinterfaces(self) -> List[Dict]:
+    def get_all_subinterfaces(self) -> Optional[List[Dict]]:
         """
         Get all subinterfaces from FTD.
-        
+
         Subinterfaces are accessed via their parent interface:
         - Physical: GET /devices/default/interfaces/{parentId}/subinterfaces
         - EtherChannel: GET /devices/default/etherchannelinterfaces/{parentId}/subinterfaces
-        
+
         Returns:
-            List of all subinterfaces found
+            List of all subinterfaces found, or None when any listing failed
+            (callers must treat None as a failed phase).
         """
         all_subinterfaces = []
-        
+
         print("  Scanning for subinterfaces...")
-        
+
         # Check under physical interfaces
         # GET /devices/default/interfaces
         interfaces = self.get_all_objects("/devices/default/interfaces")
-        
-        if interfaces:
-            for intf in interfaces:
-                intf_id = intf.get('id')
-                intf_type = intf.get('type', '')
-                intf_name = intf.get('hardwareName', intf.get('name', ''))
-                
-                # Only check physical interfaces (not etherchannels which are separate)
-                if intf_id and intf_type == 'physicalinterface':
-                    subintfs = self.get_all_objects(f"/devices/default/interfaces/{intf_id}/subinterfaces")
-                    if subintfs:
-                        for si in subintfs:
-                            si['_parent_id'] = intf_id
-                            si['_parent_name'] = intf_name
-                            si['_parent_type'] = 'physical'
-                        all_subinterfaces.extend(subintfs)
-                        
-                        if self.debug:
-                            print(f"    Found {len(subintfs)} subinterfaces under {intf_name}")
-        
+        if interfaces is None:
+            return None
+
+        for intf in interfaces:
+            intf_id = intf.get('id')
+            intf_type = intf.get('type', '')
+            intf_name = intf.get('hardwareName', intf.get('name', ''))
+
+            # Only check physical interfaces (not etherchannels which are separate)
+            if intf_id and intf_type == 'physicalinterface':
+                subintfs = self.get_all_objects(f"/devices/default/interfaces/{intf_id}/subinterfaces")
+                if subintfs is None:
+                    return None
+                if subintfs:
+                    for si in subintfs:
+                        si['_parent_id'] = intf_id
+                        si['_parent_name'] = intf_name
+                        si['_parent_type'] = 'physical'
+                    all_subinterfaces.extend(subintfs)
+
+                    if self.debug:
+                        print(f"    Found {len(subintfs)} subinterfaces under {intf_name}")
+
         # Check under etherchannels
         # GET /devices/default/etherchannelinterfaces
         etherchannels = self.get_all_objects("/devices/default/etherchannelinterfaces")
-        
-        if etherchannels:
-            for ec in etherchannels:
-                ec_id = ec.get('id')
-                ec_name = ec.get('hardwareName', ec.get('name', ''))
-                
-                if ec_id:
-                    subintfs = self.get_all_objects(f"/devices/default/etherchannelinterfaces/{ec_id}/subinterfaces")
-                    if subintfs:
-                        for si in subintfs:
-                            si['_parent_id'] = ec_id
-                            si['_parent_name'] = ec_name
-                            si['_parent_type'] = 'etherchannel'
-                        all_subinterfaces.extend(subintfs)
-                        
-                        if self.debug:
-                            print(f"    Found {len(subintfs)} subinterfaces under {ec_name}")
-        
+        if etherchannels is None:
+            return None
+
+        for ec in etherchannels:
+            ec_id = ec.get('id')
+            ec_name = ec.get('hardwareName', ec.get('name', ''))
+
+            if ec_id:
+                subintfs = self.get_all_objects(f"/devices/default/etherchannelinterfaces/{ec_id}/subinterfaces")
+                if subintfs is None:
+                    return None
+                if subintfs:
+                    for si in subintfs:
+                        si['_parent_id'] = ec_id
+                        si['_parent_name'] = ec_name
+                        si['_parent_type'] = 'etherchannel'
+                    all_subinterfaces.extend(subintfs)
+
+                    if self.debug:
+                        print(f"    Found {len(subintfs)} subinterfaces under {ec_name}")
+
         return all_subinterfaces
     
     def delete_subinterface(self, subintf: Dict, dry_run: bool = False) -> Tuple[bool, str]:
@@ -876,6 +939,10 @@ class FTDBulkDelete(FTDBaseClient):
 
         # Get all subinterfaces from all parent interfaces
         all_subinterfaces = self.get_all_subinterfaces()
+
+        if all_subinterfaces is None:
+            print(f"  {flair('validate', 'FAIL', 'subinterface listing', 'could not retrieve subinterfaces')}")
+            return False
 
         if not all_subinterfaces:
             print("  No subinterfaces found")
@@ -1051,7 +1118,11 @@ class FTDBulkDelete(FTDBaseClient):
         
         # Get all etherchannels
         all_etherchannels = self.get_all_objects("/devices/default/etherchannelinterfaces")
-        
+
+        if all_etherchannels is None:
+            print(f"  {flair('validate', 'FAIL', 'etherchannel listing', 'could not retrieve etherchannels')}")
+            return False
+
         if not all_etherchannels:
             print("  No etherchannels found")
             return True
@@ -1151,7 +1222,11 @@ class FTDBulkDelete(FTDBaseClient):
         
         # Get all bridge groups
         all_bridge_groups = self.get_all_objects("/devices/default/bridgegroupinterfaces")
-        
+
+        if all_bridge_groups is None:
+            print(f"  {flair('validate', 'FAIL', 'bridge group listing', 'could not retrieve bridge groups')}")
+            return False
+
         if not all_bridge_groups:
             print("  No bridge groups found")
             return True
@@ -1227,20 +1302,22 @@ class FTDBulkDelete(FTDBaseClient):
         return fail_count == 0
 
     def deploy_changes(self) -> bool:
-        """Deploy pending changes."""
+        """Deploy pending changes and poll the task until completion."""
         print(f"\n{'='*60}")
         print("Deploying configuration changes...")
         print(f"{'='*60}")
-        
+
         endpoint = f"{self.base_url}/operational/deploy"
-        
+
         try:
             response = self.session.post(endpoint, json={}, timeout=30)
-            
+
             if response.status_code in [200, 201, 202]:
-                print(flair("deploy", "OK", "configuration changes"))
+                print(flair("deploy", "OK", "configuration changes initiated"))
                 print("  (Deployment may take several minutes)")
-                return True
+                # Poll the deployment task until it finishes (shared poller
+                # in FTDBaseClient).
+                return self.start_and_wait_deployment(response)
             else:
                 print(flair("deploy", "FAIL", "configuration changes", f"HTTP {response.status_code}"))
                 return False
@@ -1295,6 +1372,12 @@ Examples:
     parser.add_argument('--host', required=True, help='FTD management IP')
     parser.add_argument('-u', '--username', required=True, help='FDM username')
     parser.add_argument('-p', '--password', help='FDM password')
+    parser.add_argument('--verify-ssl', action='store_true', default=False,
+                        help='Verify the FTD management SSL certificate '
+                             '(default: disabled - mgmt certs are usually self-signed)')
+    parser.add_argument('--skip-verify', action='store_true', default=False,
+                        help='(DEPRECATED, ignored) SSL verification is already '
+                             'disabled by default; use --verify-ssl to enable it')
     parser.add_argument('--dry-run', action='store_true', help='Preview without deleting')
     parser.add_argument('--deploy', action='store_true', help='Deploy after deletion')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
@@ -1390,11 +1473,16 @@ Examples:
         args.appliance_model = str(meta["target_model"]).lower().strip()
 
 
+    if args.skip_verify:
+        print("[DEPRECATED] --skip-verify is ignored: SSL verification is "
+              "already disabled by default. Use --verify-ssl to enable it.")
+
     # Create client
     client = FTDBulkDelete(
         host=args.host,
         username=args.username,
         password=args.password,
+        verify_ssl=args.verify_ssl,
         debug=args.debug
     )
     
@@ -1430,7 +1518,16 @@ Examples:
         phase_deleted = client.stats["deleted"] - stats_before["deleted"]
         phase_failed = client.stats["failed"] - stats_before["failed"]
 
-        if phase_failed == 0:
+        # A phase that returned False without recording any per-item
+        # failures failed outright (e.g. the object listing itself failed).
+        # Track it so compute_outcome does not report SUCCESS.
+        phase_hard_failed = result is False and phase_failed == 0
+        if phase_hard_failed:
+            client.record_phase_failure(label)
+
+        if phase_hard_failed:
+            status = "FAIL"
+        elif phase_failed == 0:
             status = "OK"
         elif phase_deleted > 0:
             status = "PARTIAL"
@@ -1439,7 +1536,7 @@ Examples:
 
         phase_timings.append({
             "label": label, "seconds": duration,
-            "success": phase_failed == 0, "status": status,
+            "success": phase_failed == 0 and not phase_hard_failed, "status": status,
             "ok_count": phase_deleted, "failed_count": phase_failed,
         })
         return result
@@ -1540,6 +1637,27 @@ Examples:
             args.base_backoff,
             args.max_jitter,
         )
+        # Delete ICMPv4 ports (the importer creates these via
+        # /object/icmpv4ports for icmpv4portobject services)
+        record_phase("ICMPv4 Port Objects", client.delete_all_custom_objects,
+            "/object/icmpv4ports",
+            "ICMPv4 Port Objects",
+            args.dry_run,
+            args.workers,
+            args.max_attempts,
+            args.base_backoff,
+            args.max_jitter,
+        )
+        # Delete ICMPv6 ports
+        record_phase("ICMPv6 Port Objects", client.delete_all_custom_objects,
+            "/object/icmpv6ports",
+            "ICMPv6 Port Objects",
+            args.dry_run,
+            args.workers,
+            args.max_attempts,
+            args.base_backoff,
+            args.max_jitter,
+        )
 
     if args.delete_all or args.delete_address_groups:
         record_phase("Address Groups", client.delete_all_custom_objects,
@@ -1581,10 +1699,16 @@ Examples:
         total_seconds = 0.0
 
     # Deploy if requested
+    deploy_ok = True
     if args.deploy and not args.dry_run:
-        client.deploy_changes()
+        deploy_ok = client.deploy_changes()
 
     exit_code, outcome = client.compute_outcome()
+
+    # A failed deployment must be reflected in the exit code even when
+    # every individual deletion succeeded.
+    if args.deploy and not args.dry_run and not deploy_ok and exit_code == 0:
+        exit_code, outcome = 2, "DEPLOY_FAILED"
 
     if args.json_report:
         report_payload = {
@@ -1594,6 +1718,7 @@ Examples:
             "deploy_requested": args.deploy,
             "target_model": client.appliance_model,
             "stats": client.stats,
+            "phase_failures": client.phase_failures,
             "phase_timings": phase_timings,
             "total_seconds": total_seconds,
             "selected_actions": {

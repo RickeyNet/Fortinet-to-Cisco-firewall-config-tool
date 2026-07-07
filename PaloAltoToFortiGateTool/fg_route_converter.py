@@ -19,14 +19,24 @@ FortiGate CLI output format:
 
 from typing import Any, Dict, List, Optional
 
-from fg_common import sanitize_fg_name, split_cidr
+from fg_common import (
+    FG_INTERFACE_NAME_MAX_LENGTH,
+    escape_fg_string,
+    sanitize_fg_name,
+    split_cidr,
+)
 
 
 class FGRouteConverter:
     """Convert PAN-OS static routes to FortiGate router static format."""
 
-    def __init__(self, pa_config: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        pa_config: Dict[str, Any],
+        interface_name_map: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.pa_config = pa_config
+        self._interface_name_map = dict(interface_name_map or {})
         self.failed_items: List[Dict] = []
         self._stats = {
             "total": 0,
@@ -63,6 +73,9 @@ class FGRouteConverter:
                 continue
 
             nexthop: Optional[str] = route.get("nexthop")
+            # "0.0.0.0" is not a usable gateway - treat as no nexthop
+            if nexthop == "0.0.0.0":
+                nexthop = None
             interface = str(route.get("interface", "")).strip()
             metric = route.get("metric", 10)
             description = str(route.get("description", "")).strip()
@@ -74,11 +87,14 @@ class FGRouteConverter:
             lines = [f"    edit {route_id}"]
             lines.append(f"        set dst {dst_ip} {dst_mask}")
 
-            if nexthop and nexthop != "0.0.0.0":
+            if nexthop:
                 lines.append(f"        set gateway {nexthop}")
 
             if interface:
-                fg_intf = sanitize_fg_name(interface)
+                sanitized_intf = sanitize_fg_name(interface)
+                fg_intf = self._interface_name_map.get(
+                    sanitized_intf, sanitized_intf[:FG_INTERFACE_NAME_MAX_LENGTH]
+                )
                 lines.append(f'        set device "{fg_intf}"')
 
             try:
@@ -87,8 +103,7 @@ class FGRouteConverter:
                 lines.append("        set distance 10")
 
             if description:
-                safe_desc = description.replace('"', "'")
-                lines.append(f'        set comment "{safe_desc}"')
+                lines.append(f'        set comment "{escape_fg_string(description)}"')
 
             lines.append("    next")
             entries.append("\n".join(lines))

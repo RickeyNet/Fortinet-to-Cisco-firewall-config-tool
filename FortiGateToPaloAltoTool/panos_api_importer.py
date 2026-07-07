@@ -23,11 +23,23 @@ HOW TO RUN:
 
 import json
 import argparse
+import re
 import sys
 import getpass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from xml.sax.saxutils import escape, quoteattr
 
 from panos_api_base import PANOSBaseClient, XPATHS
+
+
+def _x(value: Any) -> str:
+    """Escape a value for use as XML text content."""
+    return escape(str(value))
+
+
+def _attr(value: Any) -> str:
+    """Quote and escape a value for use as an XML attribute (adds quotes)."""
+    return quoteattr(str(value))
 
 
 class PANOSImporter(PANOSBaseClient):
@@ -69,10 +81,10 @@ class PANOSImporter(PANOSBaseClient):
         value = obj["value"]
         desc = obj.get("description", "")
 
-        xml = f'<entry name="{name}">'
-        xml += f"<{pa_type}>{value}</{pa_type}>"
+        xml = f"<entry name={_attr(name)}>"
+        xml += f"<{pa_type}>{_x(value)}</{pa_type}>"
         if desc:
-            xml += f"<description>{desc}</description>"
+            xml += f"<description>{_x(desc)}</description>"
         xml += "</entry>"
         return xml
 
@@ -83,12 +95,12 @@ class PANOSImporter(PANOSBaseClient):
         members = obj.get("members", [])
         desc = obj.get("description", "")
 
-        xml = f'<entry name="{name}"><static>'
+        xml = f"<entry name={_attr(name)}><static>"
         for m in members:
-            xml += f"<member>{m}</member>"
+            xml += f"<member>{_x(m)}</member>"
         xml += "</static>"
         if desc:
-            xml += f"<description>{desc}</description>"
+            xml += f"<description>{_x(desc)}</description>"
         xml += "</entry>"
         return xml
 
@@ -99,8 +111,8 @@ class PANOSImporter(PANOSBaseClient):
         protocol = obj["protocol"]  # tcp or udp
         port = obj["port"]
 
-        xml = f'<entry name="{name}"><protocol>'
-        xml += f"<{protocol}><port>{port}</port></{protocol}>"
+        xml = f"<entry name={_attr(name)}><protocol>"
+        xml += f"<{protocol}><port>{_x(port)}</port></{protocol}>"
         xml += "</protocol></entry>"
         return xml
 
@@ -110,9 +122,9 @@ class PANOSImporter(PANOSBaseClient):
         name = obj["name"]
         members = obj.get("members", [])
 
-        xml = f'<entry name="{name}"><members>'
+        xml = f"<entry name={_attr(name)}><members>"
         for m in members:
-            xml += f"<member>{m}</member>"
+            xml += f"<member>{_x(m)}</member>"
         xml += "</members></entry>"
         return xml
 
@@ -121,54 +133,54 @@ class PANOSImporter(PANOSBaseClient):
         """Build XML element for a PAN-OS security rule."""
         name = obj["name"]
 
-        xml = f'<entry name="{name}">'
+        xml = f"<entry name={_attr(name)}>"
 
         # From zones
         xml += "<from>"
         for z in obj.get("from_zones", ["any"]):
-            xml += f"<member>{z}</member>"
+            xml += f"<member>{_x(z)}</member>"
         xml += "</from>"
 
         # To zones
         xml += "<to>"
         for z in obj.get("to_zones", ["any"]):
-            xml += f"<member>{z}</member>"
+            xml += f"<member>{_x(z)}</member>"
         xml += "</to>"
 
         # Sources
         xml += "<source>"
         for s in obj.get("sources", ["any"]):
-            xml += f"<member>{s}</member>"
+            xml += f"<member>{_x(s)}</member>"
         xml += "</source>"
 
         # Destinations
         xml += "<destination>"
         for d in obj.get("destinations", ["any"]):
-            xml += f"<member>{d}</member>"
+            xml += f"<member>{_x(d)}</member>"
         xml += "</destination>"
 
         # Services
         xml += "<service>"
         for s in obj.get("services", ["any"]):
-            xml += f"<member>{s}</member>"
+            xml += f"<member>{_x(s)}</member>"
         xml += "</service>"
 
         # Application
         xml += "<application>"
         for a in obj.get("application", ["any"]):
-            xml += f"<member>{a}</member>"
+            xml += f"<member>{_x(a)}</member>"
         xml += "</application>"
 
         # Action
-        xml += f"<action>{obj.get('action', 'deny')}</action>"
+        xml += f"<action>{_x(obj.get('action', 'deny'))}</action>"
 
         # Log
-        xml += f"<log-end>{obj.get('log_end', 'yes')}</log-end>"
+        xml += f"<log-end>{_x(obj.get('log_end', 'yes'))}</log-end>"
 
         # Description
         desc = obj.get("description", "")
         if desc:
-            xml += f"<description>{desc}</description>"
+            xml += f"<description>{_x(desc)}</description>"
 
         # Disabled
         disabled = obj.get("disabled", "no")
@@ -183,17 +195,17 @@ class PANOSImporter(PANOSBaseClient):
         """Build XML element for a PAN-OS static route."""
         name = obj["name"]
 
-        xml = f'<entry name="{name}">'
-        xml += f"<destination>{obj['destination']}</destination>"
+        xml = f"<entry name={_attr(name)}>"
+        xml += f"<destination>{_x(obj['destination'])}</destination>"
 
         if "nexthop" in obj:
-            xml += f"<nexthop><ip-address>{obj['nexthop']}</ip-address></nexthop>"
+            xml += f"<nexthop><ip-address>{_x(obj['nexthop'])}</ip-address></nexthop>"
 
         if "interface" in obj:
-            xml += f"<interface>{obj['interface']}</interface>"
+            xml += f"<interface>{_x(obj['interface'])}</interface>"
 
         if "metric" in obj:
-            xml += f"<metric>{obj['metric']}</metric>"
+            xml += f"<metric>{_x(obj['metric'])}</metric>"
 
         xml += "</entry>"
         return xml
@@ -210,9 +222,9 @@ class PANOSImporter(PANOSBaseClient):
         mode = obj.get("mode", "layer3")
         section = "layer2" if mode == "layer2" else "layer3"
 
-        xml = f'<entry name="{name}"><network><{section}>'
+        xml = f"<entry name={_attr(name)}><network><{section}>"
         for intf in interfaces:
-            xml += f"<member>{intf}</member>"
+            xml += f"<member>{_x(intf)}</member>"
         xml += f"</{section}></network></entry>"
         return xml
 
@@ -223,12 +235,12 @@ class PANOSImporter(PANOSBaseClient):
     def _build_physical_interface_xml(obj: Dict) -> str:
         """Build XML element for a PAN-OS ethernet interface (layer3 mode)."""
         name = obj["name"]
-        xml = f'<entry name="{name}"><layer3>'
+        xml = f"<entry name={_attr(name)}><layer3>"
 
         # IP address
         ip_addr = obj.get("ip_address")
         if ip_addr:
-            xml += f'<ip><entry name="{ip_addr}"/></ip>'
+            xml += f"<ip><entry name={_attr(ip_addr)}/></ip>"
 
         # DHCP
         if obj.get("dhcp"):
@@ -237,19 +249,23 @@ class PANOSImporter(PANOSBaseClient):
         # MTU
         mtu = obj.get("mtu")
         if mtu:
-            xml += f"<mtu>{mtu}</mtu>"
+            xml += f"<mtu>{_x(mtu)}</mtu>"
 
         xml += "</layer3>"
 
         # Comment
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
 
-        # Link state
+        # Link speed
         link_speed = obj.get("link_speed", "auto")
         if link_speed and link_speed != "auto":
-            xml += f"<link-speed>{link_speed}</link-speed>"
+            xml += f"<link-speed>{_x(link_speed)}</link-speed>"
+
+        # Administratively disabled on the FortiGate -> force link down
+        if obj.get("enabled") is False:
+            xml += "<link-state>down</link-state>"
 
         xml += "</entry>"
         return xml
@@ -260,13 +276,13 @@ class PANOSImporter(PANOSBaseClient):
         name = obj["name"]
         tag = obj["tag"]
 
-        xml = f'<entry name="{name}">'
-        xml += f"<tag>{tag}</tag>"
+        xml = f"<entry name={_attr(name)}>"
+        xml += f"<tag>{_x(tag)}</tag>"
 
         # IP address
         ip_addr = obj.get("ip_address")
         if ip_addr:
-            xml += f'<ip><entry name="{ip_addr}"/></ip>'
+            xml += f"<ip><entry name={_attr(ip_addr)}/></ip>"
 
         # DHCP
         if obj.get("dhcp"):
@@ -275,12 +291,12 @@ class PANOSImporter(PANOSBaseClient):
         # MTU
         mtu = obj.get("mtu")
         if mtu:
-            xml += f"<mtu>{mtu}</mtu>"
+            xml += f"<mtu>{_x(mtu)}</mtu>"
 
         # Comment
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
 
         xml += "</entry>"
         return xml
@@ -289,12 +305,12 @@ class PANOSImporter(PANOSBaseClient):
     def _build_aggregate_ethernet_xml(obj: Dict) -> str:
         """Build XML element for a PAN-OS aggregate-ethernet interface."""
         name = obj["name"]
-        xml = f'<entry name="{name}"><layer3>'
+        xml = f"<entry name={_attr(name)}><layer3>"
 
         # IP address
         ip_addr = obj.get("ip_address")
         if ip_addr:
-            xml += f'<ip><entry name="{ip_addr}"/></ip>'
+            xml += f"<ip><entry name={_attr(ip_addr)}/></ip>"
 
         # DHCP
         if obj.get("dhcp"):
@@ -303,18 +319,18 @@ class PANOSImporter(PANOSBaseClient):
         # MTU
         mtu = obj.get("mtu")
         if mtu:
-            xml += f"<mtu>{mtu}</mtu>"
+            xml += f"<mtu>{_x(mtu)}</mtu>"
 
         xml += "</layer3>"
 
         # LACP
         lacp_mode = obj.get("lacp_mode", "active")
-        xml += f"<lacp><mode>{lacp_mode}</mode></lacp>"
+        xml += f"<lacp><mode>{_x(lacp_mode)}</mode></lacp>"
 
         # Comment
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
 
         xml += "</entry>"
         return xml
@@ -324,12 +340,16 @@ class PANOSImporter(PANOSBaseClient):
         """Build XML element to assign a physical interface to an aggregate group."""
         name = obj["name"]
         ae_group = obj["aggregate_group"]
-        xml = f'<entry name="{name}">'
-        xml += f"<aggregate-group>{ae_group}</aggregate-group>"
+        xml = f"<entry name={_attr(name)}>"
+        xml += f"<aggregate-group>{_x(ae_group)}</aggregate-group>"
 
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
+
+        # Administratively disabled on the FortiGate -> force link down
+        if obj.get("enabled") is False:
+            xml += "<link-state>down</link-state>"
 
         xml += "</entry>"
         return xml
@@ -342,10 +362,13 @@ class PANOSImporter(PANOSBaseClient):
         ``_build_vlan_object_xml``); the ethernet entry just declares layer2.
         """
         name = obj["name"]
-        xml = f'<entry name="{name}"><layer2/>'
+        xml = f"<entry name={_attr(name)}><layer2/>"
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
+        # Administratively disabled on the FortiGate -> force link down
+        if obj.get("enabled") is False:
+            xml += "<link-state>down</link-state>"
         xml += "</entry>"
         return xml
 
@@ -360,13 +383,13 @@ class PANOSImporter(PANOSBaseClient):
         members = obj.get("members", [])
         svi = obj.get("vlan_interface")
 
-        xml = f'<entry name="{name}">'
+        xml = f"<entry name={_attr(name)}>"
         if svi:
-            xml += f"<virtual-interface><interface>{svi}</interface></virtual-interface>"
+            xml += f"<virtual-interface><interface>{_x(svi)}</interface></virtual-interface>"
         if members:
             xml += "<interface>"
             for m in members:
-                xml += f"<member>{m}</member>"
+                xml += f"<member>{_x(m)}</member>"
             xml += "</interface>"
         xml += "</entry>"
         return xml
@@ -375,22 +398,22 @@ class PANOSImporter(PANOSBaseClient):
     def _build_vlan_interface_xml(obj: Dict) -> str:
         """Build XML for a PAN-OS vlan.N interface (the Layer-3 SVI)."""
         name = obj["name"]
-        xml = f'<entry name="{name}">'
+        xml = f"<entry name={_attr(name)}>"
 
         ip_addr = obj.get("ip_address")
         if ip_addr:
-            xml += f'<ip><entry name="{ip_addr}"/></ip>'
+            xml += f"<ip><entry name={_attr(ip_addr)}/></ip>"
 
         if obj.get("dhcp"):
             xml += "<dhcp-client><enable>yes</enable></dhcp-client>"
 
         mtu = obj.get("mtu")
         if mtu:
-            xml += f"<mtu>{mtu}</mtu>"
+            xml += f"<mtu>{_x(mtu)}</mtu>"
 
         comment = obj.get("comment", "")
         if comment:
-            xml += f"<comment>{comment}</comment>"
+            xml += f"<comment>{_x(comment)}</comment>"
 
         xml += "</entry>"
         return xml
@@ -435,9 +458,15 @@ class PANOSImporter(PANOSBaseClient):
                     xpath = XPATHS["vlan_interface"]
                     xml_element = self._build_vlan_interface_xml(obj)
                 elif intf_type == "subinterface":
-                    parent = obj["parent"]
+                    parent = str(obj["parent"]).strip()
+                    # Subinterfaces of an aggregate-ethernet (aeN) live under
+                    # the aggregate-ethernet XPath, not ethernet.
+                    if re.match(r"^ae\d+$", parent):
+                        parent_base = XPATHS["aggregate_ethernet"]
+                    else:
+                        parent_base = XPATHS["ethernet"]
                     xpath = (
-                        f"{XPATHS['ethernet']}/entry[@name='{parent}']"
+                        f"{parent_base}/entry[@name='{parent}']"
                         "/layer3/units"
                     )
                     xml_element = self._build_subinterface_xml(obj)
@@ -476,12 +505,19 @@ class PANOSImporter(PANOSBaseClient):
 
         return fail_count == 0
 
-    def import_all(self, input_basename: str, auto_commit: bool = False) -> bool:
+    def import_all(
+        self,
+        input_basename: str,
+        auto_commit: bool = False,
+        force_commit: bool = False,
+    ) -> bool:
         """Import all object types from JSON files.
 
         Args:
             input_basename: Base name of JSON files (e.g., "pa_config")
-            auto_commit: Whether to commit after import
+            auto_commit: Whether to commit after import. The commit is skipped
+                if any import failed, unless force_commit is set.
+            force_commit: Commit even when some imports failed.
 
         Returns:
             True if all imports succeeded.
@@ -550,12 +586,17 @@ class PANOSImporter(PANOSBaseClient):
             if not ok:
                 all_ok = False
 
-        # Commit if requested
+        # Commit if requested - but never auto-commit a partially failed
+        # import unless the user explicitly forces it.
         if auto_commit and not self.dry_run:
-            success, msg = self.commit()
-            if not success:
-                print(f"[FAIL] Commit failed: {msg}")
-                all_ok = False
+            if all_ok or force_commit:
+                success, msg = self.commit()
+                if not success:
+                    print(f"[FAIL] Commit failed: {msg}")
+                    all_ok = False
+            else:
+                print("\n[SKIP] Commit skipped: some imports failed "
+                      "(re-run with --force-commit to commit anyway)")
 
         return all_ok
 
@@ -664,7 +705,10 @@ Examples:
     parser.add_argument("--password", default=None, help="PAN-OS admin password (prompts if omitted)")
     parser.add_argument("--input", default="pa_config", help="Base name of input JSON files (default: pa_config)")
     parser.add_argument("--dry-run", action="store_true", help="Preview what would be imported without making changes")
-    parser.add_argument("--commit", action="store_true", help="Automatically commit after import")
+    parser.add_argument("--commit", action="store_true",
+                        help="Automatically commit after import (skipped if any import failed)")
+    parser.add_argument("--force-commit", action="store_true",
+                        help="With --commit: commit even if some imports failed")
     parser.add_argument("--verify-ssl", action="store_true", help="Verify SSL certificate (default: disabled)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args(argv)
@@ -687,9 +731,9 @@ Examples:
     if args.dry_run:
         print("\n*** DRY-RUN MODE - no changes will be made ***\n")
         # In dry-run, we don't need to authenticate
-        client.import_all(args.input, auto_commit=False)
+        success = client.import_all(args.input, auto_commit=False)
         client.print_summary()
-        return 0
+        return 0 if success else 1
 
     # Authenticate
     if not client.authenticate():
@@ -700,7 +744,9 @@ Examples:
     client.validate_connection()
 
     # Import
-    success = client.import_all(args.input, auto_commit=args.commit)
+    success = client.import_all(
+        args.input, auto_commit=args.commit, force_commit=args.force_commit
+    )
     client.print_summary()
 
     return 0 if success else 1

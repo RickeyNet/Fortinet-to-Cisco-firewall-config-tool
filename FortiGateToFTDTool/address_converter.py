@@ -29,9 +29,15 @@ FTD JSON OUTPUT FORMAT:
         "value": "10.0.0.0/24"
     }
 """
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Set
 
-from common import sanitize_name, is_default_fortigate_address
+from common import (
+    sanitize_name,
+    is_default_fortigate_address,
+    first_item,
+    dedupe_name,
+    netmask_to_cidr,
+)
 
 
 class AddressConverter:
@@ -63,7 +69,17 @@ class AddressConverter:
 
         # Track items that failed/were skipped during conversion
         self.failed_items = []
-    
+
+        # Mapping of original sanitized name -> final FTD object name
+        # (differs when a sanitization collision forced an X_2 rename).
+        # Consumed by group/policy converters so references follow renames.
+        self.address_name_mapping: Dict[str, str] = {}
+
+        # Sanitized names of addresses that were NOT converted (factory
+        # defaults, invalid values, ...). Groups/policies filter these out
+        # instead of emitting dangling references.
+        self.skipped_addresses: Set[str] = set()
+
     def convert(self) -> List[Dict]:
         """
         Main conversion method - converts all FortiGate address objects to FTD format.
@@ -108,20 +124,17 @@ class AddressConverter:
         # Each address in the list looks like: {'OBJECT_NAME': {properties}}
         for addr_dict in addresses:
             # ================================================================
-            # STEP 2A: Extract the object name
+            # STEP 2A/2B: Extract the object name and properties
             # ================================================================
             # The object name is the only key in the dictionary
             # Example: {'SSLVPN_TUNNEL_ADDR1': {uuid: ..., type: ...}}
-            #          The object name is 'SSLVPN_TUNNEL_ADDR1'
-            
-            object_name = list(addr_dict.keys())[0]
-            
-            # ================================================================
-            # STEP 2B: Extract the object properties
-            # ================================================================
             # Properties include: uuid, type, subnet, start-ip, end-ip, comment, etc.
-            properties = addr_dict[object_name]
-            
+            item = first_item(addr_dict)
+            if item is None:
+                print("  Skipped: empty/malformed address entry")
+                continue
+            object_name, properties = item
+
             # ================================================================
             # STEP 2C: Validate the object name
             # ================================================================
@@ -132,11 +145,13 @@ class AddressConverter:
             # so they are not reported as skipped/failed items.
             if is_default_fortigate_address(object_name):
                 print(f"  Ignored: {object_name} (FortiGate default object)")
+                self.skipped_addresses.add(sanitize_name(object_name))
                 continue
 
             # Check 1: Skip if name is "none" (case-insensitive)
-            if object_name.lower() == 'none':
+            if str(object_name).lower() == 'none':
                 print(f"  Skipped: {object_name} (name is 'none')")
+                self.skipped_addresses.add(sanitize_name(object_name))
                 self.failed_items.append({"name": object_name, "reason": "name is 'none'", "config": properties})
                 continue
             
@@ -164,13 +179,15 @@ class AddressConverter:
             # Check 3: Skip if value is empty or just whitespace
             if not address_value or address_value.strip() == '':
                 print(f"  Skipped: {object_name} (empty value)")
+                self.skipped_addresses.add(sanitize_name(object_name))
                 self.failed_items.append({"name": object_name, "reason": "empty value", "config": properties})
                 continue
-            
+
             # Check 4: Skip if value is malformed (no valid IP format)
             # FQDN values are domain names, not IPs - skip IP validation for them
             if address_type != "FQDN" and not self._is_valid_address_value(address_value):
                 print(f"  Skipped: {object_name} (invalid value: {address_value})")
+                self.skipped_addresses.add(sanitize_name(object_name))
                 self.failed_items.append({"name": object_name, "reason": f"invalid value: {address_value}", "config": properties})
                 continue
             
@@ -179,14 +196,16 @@ class AddressConverter:
             # ================================================================
             # This is the final format that FTD FDM API expects
             # Sanitize the object name to replace spaces with underscores
-            sanitized_name = sanitize_name(object_name)
+            base_name = sanitize_name(object_name)
 
             # Deduplicate: if this name was already used, append _2, _3, etc.
-            if sanitized_name in used_names:
-                used_names[sanitized_name] += 1
-                sanitized_name = f"{sanitized_name}_{used_names[sanitized_name]}"
-            else:
-                used_names[sanitized_name] = 1
+            # (generated names are registered too, so a literal source object
+            # named X_2 cannot collide with a generated X_2)
+            sanitized_name = dedupe_name(base_name, used_names)
+
+            # Record the rename so groups/policies referencing the original
+            # name can follow it to the final object (first occurrence wins).
+            self.address_name_mapping.setdefault(base_name, sanitized_name)
 
             ftd_object = {
                 "name": sanitized_name,                           # Object name from FortiGate
@@ -195,7 +214,11 @@ class AddressConverter:
                 "subType": address_type,                       # HOST, NETWORK, or RANGE
                 "value": address_value                         # The formatted IP/network/range
             }
-            
+
+            # FDM FQDN objects require a dnsResolution field
+            if address_type == "FQDN":
+                ftd_object["dnsResolution"] = "IPV4_ONLY"
+
             # Add the converted object to our result list
             network_objects.append(ftd_object)
             
@@ -407,38 +430,12 @@ class AddressConverter:
         
         Args:
             netmask: Subnet mask in dotted decimal format (e.g., "255.255.255.0")
-            
+
         Returns:
             Integer representing CIDR prefix length (e.g., 24)
         """
-        try:
-            # Split the netmask into individual octets
-            # "255.255.255.0" becomes ["255", "255", "255", "0"]
-            octets = netmask.split('.')
-            
-            # Convert each octet to binary and concatenate
-            binary_str = ''
-            for octet in octets:
-                # Convert string to integer, then to binary
-                # bin() gives us "0b11111111", so we remove "0b" with [2:]
-                # zfill(8) pads with zeros to ensure 8 bits
-                # Example: 255 -> "0b11111111" -> "11111111"
-                #          0   -> "0b0" -> "00000000"
-                binary_octet = bin(int(octet))[2:].zfill(8)
-                binary_str += binary_octet
-            
-            # Count the number of '1' bits in the binary string
-            # Example: "11111111111111111111111100000000" has 24 ones
-            cidr_prefix = binary_str.count('1')
-            
-            return cidr_prefix
-            
-        except (ValueError, AttributeError) as e:
-            # If conversion fails (invalid netmask), print warning and default to /32
-            # /32 is the safest default as it represents a single host
-            print(f"  Warning: Could not convert netmask '{netmask}' to CIDR (Error: {e})")
-            print("    Defaulting to /32 (single host)")
-            return 32
+        # Shared implementation (warns and defaults to /32 on invalid input)
+        return netmask_to_cidr(netmask)
     
     def _is_valid_address_value(self, value: str) -> bool:
         """
@@ -510,11 +507,19 @@ class AddressConverter:
     def get_object_count(self) -> int:
         """
         Get the number of address objects that were converted.
-        
+
         Returns:
             Integer count of converted objects
         """
         return len(self.ftd_network_objects)
+
+    def get_address_name_mapping(self) -> Dict[str, str]:
+        """Return {original sanitized name: final FTD object name}."""
+        return self.address_name_mapping
+
+    def get_skipped_addresses(self) -> Set[str]:
+        """Return the sanitized names of addresses that were not converted."""
+        return self.skipped_addresses
 
 
 # =============================================================================

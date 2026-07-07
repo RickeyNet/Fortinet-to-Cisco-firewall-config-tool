@@ -18,16 +18,16 @@ Supported ASA config sections:
     - NAT rules (parsed for reference, not auto-converted)
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
-# ── Well-known ASA port name → number mapping ─────────────────────────────
+# ── Well-known ASA port name -> number mapping ─────────────────────────────
 ASA_PORT_NAMES: Dict[str, str] = {
     "ftp-data": "20", "ftp": "21", "ssh": "22", "telnet": "23",
     "smtp": "25", "time": "37", "whois": "43", "tacacs": "49",
     "domain": "53", "dns": "53", "bootps": "67", "bootpc": "68",
     "tftp": "69", "gopher": "70", "finger": "79",
-    "http": "80", "www": "80", "kerberos": "88",
+    "http": "80", "www": "80", "kerberos": "750",  # ASA literal (IANA 88)
     "pop2": "109", "pop3": "110", "sunrpc": "111",
     "ident": "113", "nntp": "119", "ntp": "123",
     "netbios-ns": "137", "netbios-dgm": "138", "netbios-ssn": "139",
@@ -36,8 +36,11 @@ ASA_PORT_NAMES: Dict[str, str] = {
     "cmd": "514", "syslog": "514", "lpd": "515",
     "isakmp": "500", "login": "513", "rsh": "514",
     "rtsp": "554", "ldaps": "636",
-    "sqlnet": "1521", "h323": "1720", "pptp": "1723",
-    "radius": "1812", "radius-acct": "1813",
+    # ASA literals that differ from IANA: kerberos (IANA 88) -> 750,
+    # sqlnet (IANA 1521) -> 1522, radius (IANA 1812) -> 1645,
+    # radius-acct (IANA 1813) -> 1646.
+    "sqlnet": "1522", "h323": "1720", "pptp": "1723",
+    "radius": "1645", "radius-acct": "1646",
     "nfs": "2049", "mysql": "3306", "rdp": "3389",
     "sip": "5060", "aol": "5190",
     "pcanywhere-data": "5631", "pcanywhere-status": "5632",
@@ -63,7 +66,8 @@ class ASAParser:
         Returns a dict with keys:
             hostname, interfaces, routes, network_objects,
             network_object_groups, service_objects, service_object_groups,
-            access_lists, access_groups, nat_rules
+            icmp_type_groups, protocol_groups, access_lists, access_groups,
+            nat_rules, skipped_acl_lines
         """
         lines = config_text.splitlines()
         result: Dict[str, Any] = {
@@ -74,9 +78,17 @@ class ASAParser:
             "network_object_groups": {},
             "service_objects": {},
             "service_object_groups": {},
+            # Parsed-but-unsupported group types (recorded so the converter
+            # can report references to them instead of emitting dangling refs)
+            "icmp_type_groups": {},
+            "protocol_groups": {},
             "access_lists": {},
+            # ACL name -> LIST of bindings (an ACL can be bound to multiple
+            # interfaces and/or globally)
             "access_groups": {},
             "nat_rules": [],
+            # ACL lines that could not be parsed (reported, never silent)
+            "skipped_acl_lines": [],
         }
 
         i = 0
@@ -119,6 +131,20 @@ class ASAParser:
                 self._parse_service_object_group(stripped, block, result)
                 continue
 
+            elif stripped.startswith("object-group icmp-type "):
+                block, i = self._collect_block(lines, i)
+                self._parse_unsupported_group(
+                    stripped, block, result, "icmp_type_groups"
+                )
+                continue
+
+            elif stripped.startswith("object-group protocol "):
+                block, i = self._collect_block(lines, i)
+                self._parse_unsupported_group(
+                    stripped, block, result, "protocol_groups"
+                )
+                continue
+
             elif stripped.startswith("route "):
                 self._parse_route(stripped, result)
 
@@ -132,6 +158,10 @@ class ASAParser:
                 self._parse_nat_rule(stripped, result)
 
             i += 1
+
+        if result["skipped_acl_lines"]:
+            print(f"  WARNING: {len(result['skipped_acl_lines'])} access-list "
+                  f"line(s) could not be converted (see warnings above)")
 
         return result
 
@@ -176,7 +206,9 @@ class ASAParser:
             "security_level": 0,
             "ip_address": "",
             "netmask": "",
-            "shutdown": True,
+            # 'show run' omits 'no shutdown' for enabled interfaces, so an
+            # interface is enabled unless an explicit 'shutdown' line appears.
+            "shutdown": False,
             "management_only": False,
         }
 
@@ -213,7 +245,12 @@ class ASAParser:
         if not name:
             return
 
-        obj: Dict[str, Any] = {"type": "", "value": "", "netmask": "", "fqdn": ""}
+        # ASA re-declares 'object network <name>' blocks for object-NAT.
+        # Merge into any existing object instead of overwriting it, so the
+        # NAT block does not wipe out the address definition.
+        obj: Dict[str, Any] = result["network_objects"].get(
+            name, {"type": "", "value": "", "netmask": "", "fqdn": ""}
+        )
 
         for line in body:
             if line.startswith("subnet "):
@@ -236,7 +273,8 @@ class ASAParser:
             elif line.startswith("description "):
                 obj["description"] = line.split(None, 1)[1]
             elif line.startswith("nat "):
-                pass  # NAT inside object - skip
+                # Object-NAT: record for the manual-review NAT output
+                result["nat_rules"].append(f"object network {name}: {line}")
 
         result["network_objects"][name] = obj
 
@@ -296,7 +334,7 @@ class ASAParser:
                     if i < len(tokens):
                         obj["src_port"] = _resolve_port(tokens[i])
             elif tokens[i] == "eq":
-                # No direction keyword → assume destination
+                # No direction keyword -> assume destination
                 i += 1
                 if i < len(tokens):
                     obj["dst_port"] = _resolve_port(tokens[i])
@@ -413,6 +451,14 @@ class ASAParser:
                             "protocol": proto,
                             "port": port_str,
                         })
+                    else:
+                        # Protocol-only member (e.g. 'service-object icmp'):
+                        # record it so the converter can report it instead of
+                        # dropping it silently.
+                        service_refs.append({
+                            "type": "protocol",
+                            "protocol": proto,
+                        })
             elif line.startswith("group-object "):
                 ref = line.split()[1] if len(line.split()) >= 2 else ""
                 if ref:
@@ -423,6 +469,21 @@ class ASAParser:
             "members": members,
             "service_refs": service_refs,
         }
+
+    # ── Unsupported object-group types (icmp-type / protocol) ──────────
+    def _parse_unsupported_group(
+        self, header: str, body: List[str], result: Dict, key: str
+    ) -> None:
+        """Record an icmp-type / protocol object-group.
+
+        These have no PAN-OS service equivalent; they are stored so that
+        references to them can be reported instead of silently dropped.
+        """
+        tokens = header.split()
+        name = tokens[2] if len(tokens) >= 3 else ""
+        if not name:
+            return
+        result[key][name] = {"members": list(body)}
 
     # ── Static route parsing ───────────────────────────────────────────
     def _parse_route(self, line: str, result: Dict) -> None:
@@ -448,31 +509,64 @@ class ASAParser:
 
     # ── Access-list entry parsing ──────────────────────────────────────
     def _parse_access_list_entry(self, line: str, result: Dict) -> None:
-        """Parse an extended ACE line into structured data."""
+        """Parse an extended or standard ACE line into structured data.
+
+        Unparseable lines are recorded in result['skipped_acl_lines'] and
+        reported - never dropped silently.
+        """
         tokens = line.split()
-        # access-list <name> extended <action> ...
-        if len(tokens) < 5 or tokens[2] != "extended":
+        acl_name = tokens[1] if len(tokens) >= 2 else ""
+
+        # Remarks carry no policy - ignore without warning
+        if len(tokens) >= 3 and tokens[2] == "remark":
             return
 
-        acl_name = tokens[1]
-        action = tokens[3]
+        ace: Optional[Dict[str, Any]] = None
+        if len(tokens) >= 5 and tokens[2] == "extended":
+            ace = self._parse_ace_tokens(
+                tokens[4:], tokens[3], set(result["service_object_groups"])
+            )
+        elif len(tokens) >= 5 and tokens[2] == "standard":
+            ace = self._parse_standard_ace(tokens[3], tokens[4:])
+        else:
+            self._skip_acl_line(line, result, "unsupported ACL form")
+            return
 
-        ace = self._parse_ace_tokens(tokens[4:], action)
         if ace is None:
+            self._skip_acl_line(line, result, "could not parse ACE")
+            return
+        if ace.get("skip_reason"):
+            self._skip_acl_line(line, result, ace["skip_reason"])
             return
 
         if acl_name not in result["access_lists"]:
             result["access_lists"][acl_name] = []
         result["access_lists"][acl_name].append(ace)
 
-    def _parse_ace_tokens(
-        self, tokens: List[str], action: str
-    ) -> Optional[Dict[str, Any]]:
-        """Parse the token stream after 'access-list <name> extended <action>'.
+    @staticmethod
+    def _skip_acl_line(line: str, result: Dict, reason: str) -> None:
+        result["skipped_acl_lines"].append({"line": line, "reason": reason})
+        print(f"  WARNING: skipped ACL line ({reason}): {line}")
 
-        Returns a structured ACE dict or None if parsing fails.
-        """
-        ace: Dict[str, Any] = {
+    def _parse_standard_ace(
+        self, action: str, tokens: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Parse a standard ACE (source-only match, any protocol)."""
+        stream = _TokenStream(tokens)
+        src = self._parse_address_spec(stream)
+        if src is None:
+            return None
+        ace = self._new_ace(action)
+        ace["protocol"] = "ip"
+        ace["source"] = src
+        ace["destination"] = {"type": "any"}
+        if src.get("type") in ("any6", "interface"):
+            ace["skip_reason"] = self._address_skip_reason(src)
+        return ace
+
+    @staticmethod
+    def _new_ace(action: str) -> Dict[str, Any]:
+        return {
             "action": action,
             "protocol": "",
             "protocol_ref_type": None,  # "object" or "object-group"
@@ -482,7 +576,27 @@ class ASAParser:
             "destination": {},
             "dest_port": None,
             "log": False,
+            "inactive": False,
+            "time_range": None,
         }
+
+    @staticmethod
+    def _address_skip_reason(spec: Dict[str, str]) -> str:
+        if spec.get("type") == "any6":
+            return "IPv6 (any6) not supported"
+        return (f"'interface {spec.get('name', '')}' address "
+                f"not supported")
+
+    def _parse_ace_tokens(
+        self, tokens: List[str], action: str,
+        service_group_names: Set[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Parse the token stream after 'access-list <name> extended <action>'.
+
+        Returns a structured ACE dict or None if parsing fails. ACEs that
+        parsed but cannot be converted carry a 'skip_reason' key.
+        """
+        ace = self._new_ace(action)
 
         stream = _TokenStream(tokens)
 
@@ -508,9 +622,9 @@ class ASAParser:
         ace["source"] = src
 
         # ── Source port (only for tcp/udp with explicit protocol) ──
-        has_ports = ace["protocol"] in ("tcp", "udp")
+        has_ports = ace["protocol"] in ("tcp", "udp", "tcp-udp")
         if has_ports:
-            port_spec = self._try_parse_port_spec(stream)
+            port_spec = self._try_parse_port_spec(stream, service_group_names)
             if port_spec is not None:
                 ace["source_port"] = port_spec
 
@@ -522,7 +636,7 @@ class ASAParser:
 
         # ── Destination port (only for tcp/udp with explicit protocol) ──
         if has_ports:
-            port_spec = self._try_parse_port_spec(stream)
+            port_spec = self._try_parse_port_spec(stream, service_group_names)
             if port_spec is not None:
                 ace["dest_port"] = port_spec
 
@@ -531,6 +645,16 @@ class ASAParser:
             tok = stream.consume()
             if tok == "log":
                 ace["log"] = True
+            elif tok == "inactive":
+                ace["inactive"] = True
+            elif tok == "time-range":
+                ace["time_range"] = stream.consume() or ""
+
+        # Unconvertible address specifiers (IPv6 / interface keyword)
+        for spec in (ace["source"], ace["destination"]):
+            if spec.get("type") in ("any6", "interface"):
+                ace["skip_reason"] = self._address_skip_reason(spec)
+                break
 
         return ace
 
@@ -544,6 +668,13 @@ class ASAParser:
 
         if token in ("any", "any4"):
             return {"type": "any"}
+        elif token == "any6":
+            # IPv6 - recorded so the ACE can be skipped with a warning
+            return {"type": "any6"}
+        elif token == "interface":
+            # 'interface <nameif>' - recorded so the ACE can be skipped
+            nameif = stream.consume()
+            return {"type": "interface", "name": nameif or ""}
         elif token == "host":
             ip = stream.consume()
             return {"type": "host", "value": ip or ""}
@@ -559,7 +690,8 @@ class ASAParser:
             return {"type": "subnet", "value": token, "netmask": mask or ""}
 
     def _try_parse_port_spec(
-        self, stream: "_TokenStream"
+        self, stream: "_TokenStream",
+        service_group_names: Set[str],
     ) -> Optional[Dict[str, str]]:
         """Try to parse a port operator from the token stream.
 
@@ -596,27 +728,36 @@ class ASAParser:
             port = stream.consume()
             return {"type": "neq", "port": _resolve_port(port or "")}
         elif token == "object-group":
-            stream.consume()
-            name = stream.consume()
-            return {"type": "object-group", "name": name or ""}
+            # Only a SERVICE group here is a port spec; a network group in
+            # this position is the destination address - don't consume it.
+            name = stream.peek_at(1)
+            if name is not None and name in service_group_names:
+                stream.consume()
+                stream.consume()
+                return {"type": "object-group", "name": name}
 
         return None
 
     # ── Access-group parsing ───────────────────────────────────────────
     def _parse_access_group(self, line: str, result: Dict) -> None:
-        """Parse: access-group <acl-name> in interface <nameif>"""
+        """Parse: access-group <acl> in|out interface <nameif>
+                  access-group <acl> global
+
+        An ACL may be bound multiple times, so bindings are kept as a list.
+        """
         tokens = line.split()
-        if len(tokens) < 5:
+        if len(tokens) < 3:
             return
 
         acl_name = tokens[1]
-        direction = tokens[2]
-        interface = tokens[4] if len(tokens) >= 5 else ""
+        if tokens[2] == "global":
+            binding = {"direction": "global", "interface": ""}
+        elif len(tokens) >= 5:
+            binding = {"direction": tokens[2], "interface": tokens[4]}
+        else:
+            return
 
-        result["access_groups"][acl_name] = {
-            "direction": direction,
-            "interface": interface,
-        }
+        result["access_groups"].setdefault(acl_name, []).append(binding)
 
     # ── NAT rule parsing ──────────────────────────────────────────────
     def _parse_nat_rule(self, line: str, result: Dict) -> None:
@@ -634,6 +775,13 @@ class _TokenStream:
     def peek(self) -> Optional[str]:
         if self._pos < len(self._tokens):
             return self._tokens[self._pos]
+        return None
+
+    def peek_at(self, offset: int) -> Optional[str]:
+        """Peek at the token 'offset' positions ahead without consuming."""
+        idx = self._pos + offset
+        if idx < len(self._tokens):
+            return self._tokens[idx]
         return None
 
     def consume(self) -> Optional[str]:

@@ -21,6 +21,7 @@ To change the built-in default, run:
 """
 
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -65,7 +66,7 @@ def _load_credentials() -> tuple[str, str]:
     """Return (salt_hex, hash_hex) from the JSON file or the built-in default."""
     if os.path.isfile(_AUTH_FILE):
         try:
-            with open(_AUTH_FILE, "r") as f:
+            with open(_AUTH_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data["salt"], data["hash"]
         except (KeyError, ValueError, json.JSONDecodeError):
@@ -96,7 +97,7 @@ def set_password(plaintext: str) -> None:
         "salt": salt.hex(),
         "hash": pw_hash,
     }
-    with open(_AUTH_FILE, "w") as f:
+    with open(_AUTH_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
@@ -108,9 +109,13 @@ def verify_password(plaintext: str) -> bool:
     salt_hex, expected_hash = _load_credentials()
     try:
         salt = bytes.fromhex(salt_hex)
-    except ValueError:
-        return False
-    return _hash_password(plaintext, salt) == expected_hash
+    except (TypeError, ValueError):
+        return False  # corrupt override file (salt not a hex string)
+    # Constant-time comparison - avoids leaking hash prefixes via timing.
+    try:
+        return hmac.compare_digest(_hash_password(plaintext, salt), expected_hash)
+    except TypeError:
+        return False  # corrupt override file (hash not an ASCII hex string)
 
 
 def reset_to_default() -> None:

@@ -284,6 +284,10 @@ Examples:
     try:
         cleaned_yaml = preprocess_yaml_file(args.input_file)
         fg_config = yaml.safe_load(cleaned_yaml)
+        if not isinstance(fg_config, dict):
+            print(f"\n[ERROR] '{args.input_file}' is empty or not a valid "
+                  "FortiGate YAML configuration (expected a top-level mapping)")
+            return 1
         print("[OK] YAML file loaded and cleaned successfully")
 
         # Remove problematic sections from parsed config
@@ -380,6 +384,9 @@ Examples:
     address_objects = address_converter.convert()
     print(f"[OK] Converted {len(address_objects)} address objects")
 
+    skipped_addresses = address_converter.get_skipped_addresses()
+    address_name_map = address_converter.get_name_map()
+
     # ========================================================================
     # STEP 7: Convert address groups
     # ========================================================================
@@ -387,10 +394,17 @@ Examples:
     print("Converting Address Groups...")
     print("-" * 60)
 
+    address_group_converter.set_address_context(
+        skipped_addresses=skipped_addresses,
+        address_name_map=address_name_map,
+    )
     address_groups = address_group_converter.convert()
     print(f"[OK] Converted {len(address_groups)} address groups")
 
     address_group_names = {g["name"] for g in address_groups}
+    address_group_name_map = address_group_converter.get_name_map()
+    # Policy refs to skipped groups are filtered like skipped addresses
+    skipped_addresses |= address_group_converter.get_skipped_groups()
 
     # ========================================================================
     # STEP 8: Convert service objects
@@ -403,6 +417,7 @@ Examples:
     service_stats = service_converter.get_statistics()
     service_name_mapping = service_converter.get_service_name_mapping()
     skipped_services = service_converter.get_skipped_services()
+    ping_services = service_converter.get_ping_services()
 
     print(f"[OK] Converted {service_stats['total_objects']} service objects")
     print(f"  - TCP objects: {service_stats['tcp_objects']}")
@@ -411,6 +426,9 @@ Examples:
         print(f"  - Services split (TCP+UDP): {service_stats['split_services']}")
     if service_stats["icmp_skipped"] > 0:
         print(f"  - Skipped (ICMP/non-port): {service_stats['icmp_skipped']}")
+    if service_stats["ping_services"] > 0:
+        print(f"  - Ping services (-> application 'ping'): "
+              f"{service_stats['ping_services']}")
 
     # Build split_services set
     split_services = set()
@@ -434,6 +452,9 @@ Examples:
     print(f"[OK] Converted {len(service_groups)} service groups")
 
     service_group_names = {g["name"] for g in service_groups}
+    service_group_name_map = service_group_converter.get_name_map()
+    # Policy refs to skipped groups are filtered like skipped services
+    skipped_services = skipped_services | service_group_converter.get_skipped_groups()
 
     # ========================================================================
     # STEP 10: Convert firewall policies to security rules
@@ -449,6 +470,11 @@ Examples:
         address_groups=address_group_names,
         service_groups=service_group_names,
         interface_name_mapping=zone_mapping,
+        skipped_addresses=skipped_addresses,
+        ping_services=ping_services,
+        address_name_map=address_name_map,
+        address_group_name_map=address_group_name_map,
+        service_group_name_map=service_group_name_map,
     )
     security_rules = policy_converter.convert()
 
@@ -456,6 +482,8 @@ Examples:
     print(f"[OK] Converted {policy_stats['total_rules']} security rules")
     print(f"  - Allow rules: {policy_stats['allow_rules']}")
     print(f"  - Deny rules: {policy_stats['deny_rules']}")
+    if policy_stats.get("disabled_rules"):
+        print(f"  - Disabled rules: {policy_stats['disabled_rules']}")
 
     # ========================================================================
     # STEP 11: Convert static routes
@@ -532,8 +560,12 @@ Examples:
             conversion_failures["interfaces"] = interface_converter.failed_items
         if address_converter.failed_items:
             conversion_failures["address_objects"] = address_converter.failed_items
+        if address_group_converter.failed_items:
+            conversion_failures["address_groups"] = address_group_converter.failed_items
         if service_converter.failed_items:
             conversion_failures["service_objects"] = service_converter.failed_items
+        if service_group_converter.failed_items:
+            conversion_failures["service_groups"] = service_group_converter.failed_items
         if route_converter.failed_items:
             conversion_failures["static_routes"] = route_converter.failed_items
         if policy_converter.failed_items:

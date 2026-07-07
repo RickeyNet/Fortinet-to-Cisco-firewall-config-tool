@@ -9,7 +9,7 @@ PAN-OS naming rules differ from FTD:
 """
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 # PAN-OS allows alphanumeric, underscore, hyphen, and period
 _PA_SANITIZE_PATTERN = re.compile(r"[^a-zA-Z0-9_.\-]")
@@ -157,16 +157,61 @@ def sanitize_name(name: str) -> str:
     return sanitized
 
 
+def first_item(entry: Any) -> Optional[Tuple[str, Dict]]:
+    """Return ``(name, properties)`` from a single-key FortiGate parser entry.
+
+    The FortiGate YAML parser emits sections as lists of single-key dicts
+    (``{name: {props...}}``). Malformed input can produce empty dicts, plain
+    strings, or ``None`` entries/properties. Returns ``None`` for empty or
+    non-dict entries; ``None``/non-dict properties are coerced to ``{}`` so
+    callers can use ``.get()`` safely.
+    """
+    if not isinstance(entry, dict) or not entry:
+        return None
+    name = next(iter(entry))
+    properties = entry[name]
+    if not isinstance(properties, dict):
+        properties = {}
+    return str(name), properties
+
+
+def dedup_name(sanitized: str, used_names: Dict[str, int]) -> str:
+    """Return a unique object name, tracking usage in *used_names*.
+
+    On collision a ``_N`` suffix is appended; the base is re-trimmed so the
+    final name never exceeds ``PA_NAME_MAX_LENGTH`` and stays unique.
+    """
+    if sanitized not in used_names:
+        used_names[sanitized] = 1
+        return sanitized
+    while True:
+        used_names[sanitized] += 1
+        suffix = f"_{used_names[sanitized]}"
+        candidate = sanitized[: PA_NAME_MAX_LENGTH - len(suffix)] + suffix
+        if candidate not in used_names:
+            used_names[candidate] = 1
+            return candidate
+
+
 def netmask_to_cidr(netmask: str) -> int:
     """Convert a dotted-decimal netmask to CIDR prefix length.
 
     Example: '255.255.255.0' -> 24
+
+    Non-contiguous or malformed masks are invalid; a warning is printed and
+    32 (host mask, the safest narrow match) is returned.
     """
     try:
         parts = netmask.split(".")
+        if len(parts) != 4:
+            raise ValueError(netmask)
         binary = "".join(f"{int(p):08b}" for p in parts)
+        # A valid mask is contiguous 1s followed by 0s (and exactly 32 bits).
+        if len(binary) != 32 or "01" in binary:
+            raise ValueError(netmask)
         return binary.count("1")
     except (ValueError, AttributeError):
+        print(f"  [WARNING] Invalid netmask '{netmask}' - defaulting to /32")
         return 32
 
 
@@ -184,8 +229,10 @@ def build_group_lookup(
     """
     lookup: Dict[str, List[str]] = {}
     for group_dict in group_entries:
-        group_name = list(group_dict.keys())[0]
-        properties = group_dict[group_name]
+        item = first_item(group_dict)
+        if item is None:
+            continue
+        group_name, properties = item
 
         members_raw = properties.get("member", [])
         if isinstance(members_raw, str):

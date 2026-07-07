@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import random
+import re
 import time
 from typing import Callable, Iterable, Optional, Tuple, TypeVar
 
@@ -11,15 +12,15 @@ T = TypeVar("T")
 
 # Common API transient error fragments that should trigger a retry.
 TRANSIENT_ERROR_TOKENS = (
-    "423",
-    "429",
     "too many",
     "rate limit",
     "timeout",
     "temporarily",
-    "503",
-    "504",
 )
+
+# Transient HTTP status codes matched as standalone numbers (word-boundary)
+# so an object *name* that merely contains "423" does not trigger retries.
+_TRANSIENT_STATUS_RE = re.compile(r"\b(423|429|503|504)\b")
 
 
 def is_transient_api_error(error_msg: Optional[str]) -> bool:
@@ -27,6 +28,8 @@ def is_transient_api_error(error_msg: Optional[str]) -> bool:
     if not error_msg:
         return False
     msg = str(error_msg).lower()
+    if _TRANSIENT_STATUS_RE.search(msg):
+        return True
     return any(token in msg for token in TRANSIENT_ERROR_TOKENS)
 
 

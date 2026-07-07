@@ -66,9 +66,10 @@ def _load_runtime_profile() -> Dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
-            return {}
+            continue  # unreadable/corrupt candidate - try the next one
+        if isinstance(data, dict):
+            return data
     return {}
 
 
@@ -122,12 +123,21 @@ asa_convert_main = None
 pa_to_fg_convert_main = None
 ftd_to_fg_convert_main = None
 
+_CLEANUP_IMPORT_ERROR = ""
 if _CLEANUP_ENABLED:
-    from ftd_api_cleanup import main as cleanup_main       # noqa: E402
-    from cleanup_auth import (                              # noqa: E402
-        set_password, verify_password,
-        has_custom_password, reset_to_default,
-    )  # stdlib only - no third-party deps, portable across machines
+    try:
+        from ftd_api_cleanup import main as cleanup_main       # noqa: E402
+        from cleanup_auth import (                              # noqa: E402
+            set_password, verify_password,
+            has_custom_password, reset_to_default,
+        )  # stdlib only - no third-party deps, portable across machines
+    except ImportError as _e:
+        # A cleanup-stripped frozen build can still end up with a profile that
+        # claims cleanup is enabled (e.g. a missing/corrupt runtime profile
+        # falls back to full-featured defaults). Degrade to cleanup-disabled
+        # with a visible warning instead of crashing a windowed exe.
+        _CLEANUP_ENABLED = False
+        _CLEANUP_IMPORT_ERROR = str(_e)
 
 # Palo Alto modules - optional (only needed when PA platform is selected)
 _PA_IMPORT_ERROR = ""
@@ -136,7 +146,13 @@ try:
     from panos_api_importer import main as pa_import_main     # noqa: E402
     _PA_AVAILABLE = True
     if _CLEANUP_ENABLED:
-        from panos_api_cleanup import main as pa_cleanup_main     # noqa: E402
+        try:
+            from panos_api_cleanup import main as pa_cleanup_main     # noqa: E402
+        except ImportError as _e:
+            # Same degradation as above: keep PA convert/import usable but
+            # disable the Cleanup feature instead of crashing at startup.
+            _CLEANUP_ENABLED = False
+            _CLEANUP_IMPORT_ERROR = _CLEANUP_IMPORT_ERROR or str(_e)
 except ImportError as _e:
     _PA_AVAILABLE = False
     _PA_IMPORT_ERROR = str(_e)
@@ -286,6 +302,47 @@ def _profile_title(default: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cleanup "What to Delete" options
+# ---------------------------------------------------------------------------
+# One entry per checkbox on the Cleanup tab:
+#   (key, FTD label, FTD flag, PA label, PA flag)
+# A None PA label/flag means panos_api_cleanup.py has no equivalent, so the
+# checkbox is hidden (and unchecked) while the target is Palo Alto PAN-OS.
+# PA's single --delete-interfaces flag both resets ethernet interfaces and
+# deletes aggregate-ethernet configs, so it maps to the interface-reset row.
+CLEANUP_DELETE_OPTIONS = [
+    ("rules", "Access Rules", "--delete-rules",
+     "Security Rules", "--delete-security-rules"),
+    ("routes", "Static Routes", "--delete-routes",
+     "Static Routes", "--delete-static-routes"),
+    ("subinterfaces", "Subinterfaces", "--delete-subinterfaces",
+     None, None),
+    ("etherchannels", "EtherChannels", "--delete-etherchannels",
+     None, None),
+    ("security-zones", "Security Zones", "--delete-security-zones",
+     "Zones", "--delete-zones"),
+    ("bridge-groups", "Bridge Groups", "--delete-bridge-groups",
+     None, None),
+    ("service-groups", "Service Groups", "--delete-service-groups",
+     "Service Groups", "--delete-service-groups"),
+    ("service-objects", "Service Objects", "--delete-service-objects",
+     "Service Objects", "--delete-service-objects"),
+    ("address-groups", "Address Groups", "--delete-address-groups",
+     "Address Groups", "--delete-address-groups"),
+    ("address-objects", "Address Objects", "--delete-address-objects",
+     "Address Objects", "--delete-address-objects"),
+    ("snmp", "SNMP Hosts & Users", "--delete-snmp",
+     None, None),
+    ("reset-physical-interfaces", "Physical Interfaces (reset)",
+     "--reset-physical-interfaces",
+     "Interfaces (reset ethernet, delete aggregates)", "--delete-interfaces"),
+]
+
+# key -> CLI flag, per platform (PA values may be None = unsupported).
+CLEANUP_FTD_FLAGS = {key: ftd_flag for key, _fl, ftd_flag, _pl, _pf in CLEANUP_DELETE_OPTIONS}
+CLEANUP_PA_FLAGS = {key: pa_flag for key, _fl, _ff, _pl, pa_flag in CLEANUP_DELETE_OPTIONS}
+
+# ---------------------------------------------------------------------------
 # argv redaction
 # ---------------------------------------------------------------------------
 # Flags whose immediate value is sensitive and must never be echoed to the
@@ -299,8 +356,10 @@ _SENSITIVE_FLAGS = frozenset({
 
 def _redact_argv(argv: List[str]) -> List[str]:
     """Return a copy of ``argv`` with values following sensitive flags
-    replaced by ``***REDACTED***``. Used before echoing the command line to
-    the GUI output widget so admin passwords don't leak into the run log.
+    replaced by ``***REDACTED***``. Handles both the two-token form
+    (``--password secret``) and the ``--password=secret`` form. Used before
+    echoing the command line to the GUI output widget so admin passwords
+    don't leak into the run log.
     """
     out = []
     redact_next = False
@@ -309,10 +368,37 @@ def _redact_argv(argv: List[str]) -> List[str]:
             out.append("***REDACTED***")
             redact_next = False
             continue
+        flag, sep, _value = token.partition("=")
+        if sep and flag in _SENSITIVE_FLAGS:
+            out.append(f"{flag}=***REDACTED***")
+            continue
         out.append(token)
         if token in _SENSITIVE_FLAGS:
             redact_next = True
     return out
+
+
+def _argv_secret_values(argv: List[str]) -> List[str]:
+    """Return the credential values embedded in ``argv`` (the values that
+    follow sensitive flags, in either the two-token or ``--flag=value`` form).
+    Used to build the plain-string secret snapshot handed to worker threads.
+    """
+    secrets: List[str] = []
+    grab_next = False
+    for token in argv:
+        if grab_next:
+            if token:
+                secrets.append(token)
+            grab_next = False
+            continue
+        flag, sep, value = token.partition("=")
+        if sep and flag in _SENSITIVE_FLAGS:
+            if value:
+                secrets.append(value)
+            continue
+        if token in _SENSITIVE_FLAGS:
+            grab_next = True
+    return secrets
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +564,21 @@ class App(tk.Tk):
         self._worker_thread: Optional[threading.Thread] = None
         self._output_queue: queue.Queue = queue.Queue()
 
+        # Widgets whose 'state' is managed explicitly (Run/Cancel buttons via
+        # _set_buttons_state, the Workers spinbox via the platform branches).
+        # _set_tab_enabled's recursive walk skips these so a tab lock/unlock
+        # never clobbers their managed state.
+        self._state_managed_widgets: set = set()
+
+        # Canvases created by _make_scrollable. One persistent global
+        # MouseWheel binding dispatches to whichever of these is under the
+        # pointer (see _on_global_mousewheel).
+        self._wheel_canvases: List[Any] = []
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel)
+
+        # Confirm before closing mid-operation (see _on_close).
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Current platform selection
         self._current_platform = DEFAULT_TARGET_PLATFORM
         self._current_source = DEFAULT_SOURCE_PLATFORM
@@ -490,6 +591,9 @@ class App(tk.Tk):
         self._agg_iface_index: Dict[str, str] = {}
         self._agg_iface_names: List[str] = []
         self._agg_visible = False
+        # Target platform the builder rows were created for; rows are cleared
+        # when the target changes (port-name formats differ per platform).
+        self._agg_shown_platform: Optional[str] = None
 
         # Import/Cleanup tab lockout state (set by _retitle_import_cleanup_tabs
         # when target doesn't support API-based import/cleanup).
@@ -507,11 +611,27 @@ class App(tk.Tk):
     def _set_window_title(self, default: str) -> None:
         self.title(_profile_title(default))
 
+    def _on_close(self) -> None:
+        """WM_DELETE_WINDOW handler - warn before closing mid-operation."""
+        if self._running:
+            if not self._ask_yes_no(
+                "Operation In Progress",
+                "An operation is in progress; closing now may leave the "
+                "firewall half-configured.\n\nClose anyway?",
+            ):
+                return
+        self.destroy()
+
     # ------------------------------------------------------------------
     # Theme engine
     # ------------------------------------------------------------------
     def _apply_theme(self, t: dict) -> None:
         """Apply a theme dictionary to all ttk styles and tk widget defaults."""
+        # Active palette for runtime configure() calls (labels re-tinted on
+        # platform change, picker Toplevels, message glyphs, ...). Using this
+        # instead of the module-level constants keeps those sites in sync
+        # with the selected theme.
+        self._colors = dict(t)
         bg       = t["bg"]
         inp      = t["input"]
         fg       = t["fg"]
@@ -708,6 +828,21 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+        # Re-tint text tags whose colors were baked in at build time.
+        help_text = getattr(self, "_help_text", None)
+        if help_text is not None:
+            help_text.tag_configure("title", foreground=accent)
+            help_text.tag_configure("h1", foreground=accent)
+            help_text.tag_configure("h2", foreground=accent_h)
+            help_text.tag_configure("italic", foreground=fg_dim)
+            help_text.tag_configure("code", foreground=accent_h)
+            help_text.tag_configure("tip", foreground=accent_h)
+            help_text.tag_configure("warning", foreground=accent)
+            help_text.tag_configure("search_hit", foreground=out_fg)
+        viewer_text = getattr(self, "viewer_text", None)
+        if viewer_text is not None:
+            viewer_text.tag_configure("search_hit", foreground=out_fg)
+
     def _on_theme_change(self, event: Optional[Any] = None) -> None:
         """Handle theme selector change."""
         name = self.theme_var.get()
@@ -726,21 +861,29 @@ class App(tk.Tk):
 
         ttk.Label(platform_frame, text="Source:").pack(side=tk.LEFT, padx=(4, 4))
         self.source_var = tk.StringVar(value=self._current_source)
-        source_combo = ttk.Combobox(
+        # Idle (not-running) states for the platform selectors; both combos
+        # are force-disabled while an operation runs (_set_buttons_state).
+        self._source_combo_idle_state = (
+            tk.DISABLED if len(SOURCE_PLATFORM_LIST) == 1 else "readonly"
+        )
+        self.source_combo = ttk.Combobox(
             platform_frame, textvariable=self.source_var,
             values=SOURCE_PLATFORM_LIST,
-            state=(tk.DISABLED if len(SOURCE_PLATFORM_LIST) == 1 else "readonly"),
+            state=self._source_combo_idle_state,
             width=14,
         )
-        source_combo.pack(side=tk.LEFT)
-        source_combo.bind("<<ComboboxSelected>>", self._on_source_change)
+        self.source_combo.pack(side=tk.LEFT)
+        self.source_combo.bind("<<ComboboxSelected>>", self._on_source_change)
 
         ttk.Label(platform_frame, text="Target:").pack(side=tk.LEFT, padx=(12, 4))
         self.platform_var = tk.StringVar(value=self._current_platform)
+        self._platform_combo_idle_state = (
+            tk.DISABLED if len(PLATFORM_LIST) == 1 else "readonly"
+        )
         self.platform_combo = ttk.Combobox(
             platform_frame, textvariable=self.platform_var,
             values=PLATFORM_LIST,
-            state=(tk.DISABLED if len(PLATFORM_LIST) == 1 else "readonly"),
+            state=self._platform_combo_idle_state,
             width=20,
         )
         self.platform_combo.pack(side=tk.LEFT)
@@ -751,6 +894,15 @@ class App(tk.Tk):
                 platform_frame, text="(PA modules not found)", foreground=_FG_DIM,
             )
             self._pa_warning.pack(side=tk.LEFT, padx=8)
+
+        if _CLEANUP_IMPORT_ERROR:
+            # Cleanup modules were expected but could not be imported -
+            # the feature degraded to disabled at startup (see module imports).
+            ttk.Label(
+                platform_frame,
+                text="(cleanup modules missing - Cleanup disabled)",
+                foreground=self._colors["fg_dim"],
+            ).pack(side=tk.LEFT, padx=8)
 
         # Theme selector (right-aligned)
         self.theme_var = tk.StringVar(value=self._current_theme)
@@ -807,6 +959,7 @@ class App(tk.Tk):
 
     def _configure_target_selector(self, targets: List[str]) -> None:
         state = tk.DISABLED if len(targets) <= 1 else "readonly"
+        self._platform_combo_idle_state = state
         self.platform_combo.configure(values=targets, state=state)
         if targets and self.platform_var.get() not in targets:
             self.platform_var.set(targets[0])
@@ -822,6 +975,15 @@ class App(tk.Tk):
                 f"No enabled targets are available for source platform: {source}",
             )
             return
+
+        if source != "Cisco FTD":
+            # The FTD file-mode toggle only applies to a Cisco FTD source.
+            # Reset and hide it for every other source so its side effects
+            # (labels, disabled browse/username fields) don't leak in; each
+            # branch below then restores its own labels via
+            # _on_platform_change().
+            self.conv_ftd_file_var.set(False)
+            self.conv_ftd_file_check.grid_remove()
 
         if source == "Cisco ASA":
             # When source is ASA, target must be Palo Alto PAN-OS
@@ -844,15 +1006,13 @@ class App(tk.Tk):
             self.conv_input_label.configure(text="FTD Host / IP:")
             self.conv_input_var.set("")
             self.conv_browse_btn.configure(state=tk.DISABLED)
-            self.conv_ha_label.configure(text="FTD Username:", foreground=_FG)
+            self.conv_ha_label.configure(text="FTD Username:", foreground=self._colors["fg"])
             self.conv_ha_entry.configure(state=tk.NORMAL)
             self.conv_ha_var.set("admin")
             self.conv_ha_hint.configure(text="FTD username (leave blank for 'admin')")
             self._update_ha_pick_visible()
         else:
             # FortiGate - restore FTD and PA targets (not FortiGate-as-target)
-            self.conv_ftd_file_var.set(False)
-            self.conv_ftd_file_check.grid_remove()  # hide FTD toggle
             self._configure_target_selector(targets)
             self._on_platform_change()
             self.conv_input_label.configure(text="Input YAML:")
@@ -869,7 +1029,7 @@ class App(tk.Tk):
             self.conv_input_var.set("")
             self.conv_browse_btn.configure(state=tk.NORMAL)
             self.conv_ha_entry.configure(state=tk.DISABLED)
-            self.conv_ha_label.configure(text="FTD Username:", foreground=_FG_DIM)
+            self.conv_ha_label.configure(text="FTD Username:", foreground=self._colors["fg_dim"])
             self.conv_ha_hint.configure(text="(username/password not needed for file mode)")
         else:
             # API mode - restore host/username fields, disable browse
@@ -877,7 +1037,7 @@ class App(tk.Tk):
             self.conv_input_var.set("")
             self.conv_browse_btn.configure(state=tk.DISABLED)
             self.conv_ha_entry.configure(state=tk.NORMAL)
-            self.conv_ha_label.configure(text="FTD Username:", foreground=_FG)
+            self.conv_ha_label.configure(text="FTD Username:", foreground=self._colors["fg"])
             self.conv_ha_var.set("admin")
             self.conv_ha_hint.configure(text="FTD username (leave blank for 'admin')")
         self._update_ha_pick_visible()
@@ -902,21 +1062,23 @@ class App(tk.Tk):
                 self._current_platform = "Cisco FTD"
                 return
 
-            # Update Convert tab
+            # Update Convert tab - re-enable model combo if a FortiGate
+            # target had disabled it.
+            self.conv_model_combo.configure(state="readonly")
             self.conv_model_combo.configure(values=PA_MODEL_LIST)
             self.conv_model_var.set("pa-440")
             if self.conv_output_var.get().strip() in DEFAULT_OUTPUT_BASES:
                 self.conv_output_var.set("pa_config")
             self.conv_ha_var.set("")
             self.conv_ha_entry.configure(state=tk.DISABLED)
-            self.conv_ha_label.configure(text="HA Port (optional):", foreground=_FG_DIM)
+            self.conv_ha_label.configure(text="HA Port (optional):", foreground=self._colors["fg_dim"])
             self.conv_ha_hint.configure(text="(not applicable for PAN-OS)")
 
             # Update Import tab labels
             self.imp_host_label.configure(text="PAN-OS Host / IP:")
             if self.imp_base_var.get().strip() in DEFAULT_OUTPUT_BASES:
                 self.imp_base_var.set("pa_config")
-            self.imp_workers_label.configure(foreground=_FG_DIM)
+            self.imp_workers_label.configure(foreground=self._colors["fg_dim"])
             self.imp_workers_spin.configure(state=tk.DISABLED)
             self.imp_deploy_cb.configure(text="Commit after import")
 
@@ -926,6 +1088,7 @@ class App(tk.Tk):
                 self.cln_model_combo.configure(values=PA_MODEL_LIST)
                 self.cln_model_var.set("pa-440")
                 self.cln_deploy_cb.configure(text="Commit after cleanup")
+                self._update_cleanup_delete_options(is_pa=True)
 
             self._retitle_import_cleanup_tabs("PAN-OS")
 
@@ -979,19 +1142,19 @@ class App(tk.Tk):
                 # HA entry repurposed as FTD username when FTD source
                 self.conv_ha_var.set("admin")
                 self.conv_ha_entry.configure(state=tk.NORMAL)
-                self.conv_ha_label.configure(text="FTD Username:", foreground=_FG)
+                self.conv_ha_label.configure(text="FTD Username:", foreground=self._colors["fg"])
                 self.conv_ha_hint.configure(text="FTD username (leave blank for 'admin')")
             else:
                 self.conv_ha_var.set("")
                 self.conv_ha_entry.configure(state=tk.DISABLED)
-                self.conv_ha_label.configure(text="HA Port (optional):", foreground=_FG_DIM)
+                self.conv_ha_label.configure(text="HA Port (optional):", foreground=self._colors["fg_dim"])
                 self.conv_ha_hint.configure(text="(not applicable for FortiGate)")
 
             # Import/Cleanup not supported for FortiGate target
             self.imp_host_label.configure(text="FortiGate Host / IP:")
             if self.imp_base_var.get().strip() in DEFAULT_OUTPUT_BASES:
                 self.imp_base_var.set("fg_config")
-            self.imp_workers_label.configure(foreground=_FG_DIM)
+            self.imp_workers_label.configure(foreground=self._colors["fg_dim"])
             self.imp_workers_spin.configure(state=tk.DISABLED)
             self.imp_deploy_cb.configure(text="(not applicable)")
 
@@ -1021,13 +1184,13 @@ class App(tk.Tk):
             if self.conv_output_var.get().strip() in DEFAULT_OUTPUT_BASES:
                 self.conv_output_var.set("ftd_config")
             self.conv_ha_entry.configure(state=tk.NORMAL)
-            self.conv_ha_label.configure(text="HA Port (optional):", foreground=_FG)
+            self.conv_ha_label.configure(text="HA Port (optional):", foreground=self._colors["fg"])
             self.conv_ha_hint.configure(text="click Pick… to choose HA port(s), or type e.g. Ethernet1/2,Ethernet1/3  (blank = none)")
 
             self.imp_host_label.configure(text="FTD Host / IP:")
             if self.imp_base_var.get().strip() in DEFAULT_OUTPUT_BASES:
                 self.imp_base_var.set("ftd_config")
-            self.imp_workers_label.configure(foreground=_FG)
+            self.imp_workers_label.configure(foreground=self._colors["fg"])
             self.imp_workers_spin.configure(state=tk.NORMAL)
             self.imp_deploy_cb.configure(text="Deploy after import")
 
@@ -1036,6 +1199,7 @@ class App(tk.Tk):
                 self.cln_model_combo.configure(values=FTD_MODEL_LIST)
                 self.cln_model_var.set("ftd-3120")
                 self.cln_deploy_cb.configure(text="Deploy after cleanup")
+                self._update_cleanup_delete_options(is_pa=False)
 
             self._retitle_import_cleanup_tabs("FTD")
 
@@ -1080,35 +1244,43 @@ class App(tk.Tk):
         self._imp_locked_by_target = tabs_locked
         self._set_tab_enabled(self._imp_tab, skip=(self.imp_output,), enabled=not tabs_locked)
 
-        if not self._cleanup_enabled:
-            return
+        if self._cleanup_enabled:
+            self._notebook.tab(self._cln_tab, text=cln_tab_text)
+            self._cln_opts_frame.configure(text=cln_frame_text)
 
-        self._notebook.tab(self._cln_tab, text=cln_tab_text)
-        self._cln_opts_frame.configure(text=cln_frame_text)
+            self._cln_locked_by_target = tabs_locked
+            self._set_tab_enabled(self._cln_tab, skip=(self.cln_output,), enabled=not tabs_locked)
 
-        self._cln_locked_by_target = tabs_locked
-        self._set_tab_enabled(self._cln_tab, skip=(self.cln_output,), enabled=not tabs_locked)
+            # Reset-password button's enabled state depends on has_custom_password(),
+            # not on target lockout - restore it when unlocking.
+            if not tabs_locked:
+                self.cln_reset_pw_btn.configure(
+                    # has_custom_password is bound only when _CLEANUP_ENABLED; runtime-guarded.
+                    state=tk.NORMAL if has_custom_password() else tk.DISABLED,  # pyright: ignore[reportOptionalCall]
+                )
 
-        # Reset-password button's enabled state depends on has_custom_password(),
-        # not on target lockout - restore it when unlocking.
-        if not tabs_locked:
-            self.cln_reset_pw_btn.configure(
-                # has_custom_password is bound only when _CLEANUP_ENABLED; runtime-guarded.
-                state=tk.NORMAL if has_custom_password() else tk.DISABLED,  # pyright: ignore[reportOptionalCall]
-            )
+        # Run/Cancel button states are excluded from the walk above (they are
+        # in _state_managed_widgets); re-apply them for the new lock flags.
+        if not self._running:
+            self._set_buttons_state(tk.NORMAL)
 
     def _set_tab_enabled(
         self, tab: Any, skip: Tuple[Any, ...] = (), enabled: bool = True,
     ) -> None:
         """Recursively enable/disable all interactive widgets in a tab.
         `skip` holds widgets (like the output Text area) whose state is managed elsewhere.
+        Widgets in self._state_managed_widgets (Run/Cancel buttons, the
+        Workers spinbox) are always skipped - their state is set explicitly
+        by _set_buttons_state / the platform-change branches, and a blind
+        re-enable here would clobber it.
         Combobox widgets are restored to 'readonly' rather than 'normal' so the
         dropdown arrow stays visible without allowing free-text editing."""
         state = tk.NORMAL if enabled else tk.DISABLED
+        managed = self._state_managed_widgets
 
         def walk(widget: Any) -> None:
             for child in widget.winfo_children():
-                if child in skip:
+                if child in skip or child in managed:
                     continue
                 try:
                     if isinstance(child, ttk.Combobox):
@@ -1636,7 +1808,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Select port" if single else "Select member ports")
         win.transient(self)
-        win.configure(bg=_BG)
+        win.configure(bg=self._colors["bg"])
 
         ttk.Label(
             win,
@@ -1928,7 +2100,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Select HA port(s)")
         win.transient(self)
-        win.configure(bg=_BG)
+        win.configure(bg=self._colors["bg"])
 
         ttk.Label(
             win,
@@ -1989,13 +2161,13 @@ class App(tk.Tk):
         hint.grid()
         if _ftd_model_module_capable(self.conv_model_var.get().strip()):
             combo.configure(state="readonly")
-            label.configure(foreground=_FG)
+            label.configure(foreground=self._colors["fg"])
             hint.configure(text="Add-on module ports (Ethernet2/1…) join the available pool")
         else:
             # No slot on this model - force None and grey the control out.
             self.conv_module_var.set(FTD_MODULE_ID_TO_LABEL["none"])
             combo.configure(state=tk.DISABLED)
-            label.configure(foreground=_FG_DIM)
+            label.configure(foreground=self._colors["fg_dim"])
             hint.configure(text="(this model has no network-module slot)")
 
     def _update_aggregation_visibility(self) -> None:
@@ -2008,6 +2180,22 @@ class App(tk.Tk):
             self._current_platform in ("Cisco FTD", "Palo Alto PAN-OS")
         )
         if is_supported:
+            # Rows built for another target hold that platform's port-name
+            # format in Members (e.g. FTD "Ethernet1/5" vs PA "ethernet1/5"),
+            # so they would emit wrongly-formatted converter args. Drop them
+            # and let the user re-add for the new target.
+            if (self._agg_rows
+                    and getattr(self, "_agg_shown_platform", None)
+                    != self._current_platform):
+                self._agg_clear_rows()
+                status = getattr(self, "status_var", None)
+                if status is not None:
+                    status.set(
+                        "Interface Aggregation rows cleared - port names "
+                        "differ per target platform; re-add rows for "
+                        f"{self._current_platform}.",
+                    )
+            self._agg_shown_platform = self._current_platform
             # Retarget the section label/port hint to the active platform.
             target_short = (
                 "FTD" if self._current_platform == "Cisco FTD" else "Palo Alto"
@@ -2039,6 +2227,10 @@ class App(tk.Tk):
         elif self._agg_visible:
             frame.pack_forget()
             self._agg_visible = False
+            # Hidden directions never use the builder - drop stale rows now so
+            # they can't resurface later with the wrong port-name format.
+            self._agg_clear_rows()
+            self._agg_shown_platform = None
 
     # ==================== IMPORT TAB ====================
     def _build_import_tab(self, notebook: ttk.Notebook) -> None:
@@ -2158,6 +2350,13 @@ class App(tk.Tk):
             command=lambda: self._clear_output(self.imp_output),
         ).pack(side=tk.LEFT, padx=8)
 
+        # Run/Cancel state is owned by _set_buttons_state; the Workers spinbox
+        # is enabled/disabled by the platform-change branches (it stays
+        # disabled for PAN-OS, where the importer has no --workers flag).
+        self._state_managed_widgets.update(
+            {self.imp_run_btn, self.imp_cancel_btn, self.imp_workers_spin},
+        )
+
         self.imp_output = self._make_output_area(tab)
 
     # ==================== CLEANUP TAB ====================
@@ -2214,28 +2413,21 @@ class App(tk.Tk):
             del_frame, text="Delete ALL custom objects", variable=self.cln_all_var,
         ).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=6, pady=4)
 
+        # Checkboxes come from the shared CLEANUP_DELETE_OPTIONS catalog so the
+        # labels/flags stay in lock-step with what each cleanup CLI actually
+        # accepts. _update_cleanup_delete_options() retitles/hides them when
+        # the target platform changes.
         self.cln_del_vars = {}
-        del_types = [
-            ("Access Rules", "rules"),
-            ("Static Routes", "routes"),
-            ("Subinterfaces", "subinterfaces"),
-            ("EtherChannels", "etherchannels"),
-            ("Security Zones", "security-zones"),
-            ("Bridge Groups", "bridge-groups"),
-            ("Service Groups", "service-groups"),
-            ("Service Objects", "service-objects"),
-            ("Address Groups", "address-groups"),
-            ("Address Objects", "address-objects"),
-            ("SNMP Hosts & Users", "snmp"),
-            ("Physical Interfaces (reset)", "reset-physical-interfaces"),
-        ]
-        for i, (label, key) in enumerate(del_types):
+        self.cln_del_checks = {}
+        for i, (key, ftd_label, _ftd_flag, _pa_label, _pa_flag) in enumerate(
+            CLEANUP_DELETE_OPTIONS,
+        ):
             var = tk.BooleanVar()
             self.cln_del_vars[key] = var
             row, col = divmod(i, 3)
-            ttk.Checkbutton(del_frame, text=label, variable=var).grid(
-                row=row + 1, column=col, sticky=tk.W, padx=6, pady=2,
-            )
+            check = ttk.Checkbutton(del_frame, text=ftd_label, variable=var)
+            check.grid(row=row + 1, column=col, sticky=tk.W, padx=6, pady=2)
+            self.cln_del_checks[key] = check
 
         # Flags
         flag_frame = ttk.Frame(tab)
@@ -2284,7 +2476,31 @@ class App(tk.Tk):
         )
         self.cln_pw_btn.pack(side=tk.RIGHT, padx=4)
 
+        # Run/Cancel state is owned by _set_buttons_state.
+        self._state_managed_widgets.update({self.cln_run_btn, self.cln_cancel_btn})
+
         self.cln_output = self._make_output_area(tab)
+
+    def _update_cleanup_delete_options(self, is_pa: bool) -> None:
+        """Retitle / show the What-to-Delete checkboxes for the active target.
+
+        Object types with no PAN-OS cleanup flag are hidden (and unchecked)
+        while the target is Palo Alto, so the GUI can never emit a
+        --delete-* flag panos_api_cleanup.py doesn't define."""
+        if not self._cleanup_enabled:
+            return
+        visible = 0
+        for key, ftd_label, _ftd_flag, pa_label, _pa_flag in CLEANUP_DELETE_OPTIONS:
+            check = self.cln_del_checks[key]
+            label = pa_label if is_pa else ftd_label
+            if label is None:
+                self.cln_del_vars[key].set(False)
+                check.grid_remove()
+                continue
+            check.configure(text=label)
+            row, col = divmod(visible, 3)
+            check.grid(row=row + 1, column=col, sticky=tk.W, padx=6, pady=2)
+            visible += 1
 
     # ==================== SNMP TAB ====================
     def _build_snmp_tab(self, notebook: ttk.Notebook) -> None:
@@ -2606,16 +2822,18 @@ class App(tk.Tk):
             )
             return
 
+        # Credential/host values use the --flag=value form so values starting
+        # with '-' aren't mistaken for flags by argparse.
         argv = [
-            "--host", host,
-            "-u", self.snmp_user_var.get().strip() or "admin",
-            "-p", password,
+            f"--host={host}",
+            f"--username={self.snmp_user_var.get().strip() or 'admin'}",
+            f"--password={password}",
             "--nms-ip", nms_ip,
             "--snmp-user", v3_user,
             "--auth-algorithm", self.snmp_auth_alg_var.get(),
-            "--auth-password", auth_pw,
+            f"--auth-password={auth_pw}",
             "--priv-algorithm", self.snmp_priv_alg_var.get(),
-            "--priv-password", priv_pw,
+            f"--priv-password={priv_pw}",
             "--interface", interface,
         ]
         host_obj_name = self.snmp_hostname_var.get().strip()
@@ -2803,7 +3021,7 @@ class App(tk.Tk):
         self._viewer_clear_highlights()
 
         # Highlight all matches
-        self.viewer_text.tag_configure("search_hit", background="#3a3a00", foreground=_OUT_FG)
+        self.viewer_text.tag_configure("search_hit", background="#3a3a00", foreground=self._colors["out_fg"])
         self.viewer_text.tag_configure("search_current", background="#48ea33", foreground="#000000")
 
         count_var = tk.IntVar()
@@ -3641,7 +3859,8 @@ class App(tk.Tk):
         """
         container = ttk.Frame(parent)
         canvas = tk.Canvas(
-            container, background=_BG, highlightthickness=0, borderwidth=0,
+            container, background=self._colors["bg"], highlightthickness=0,
+            borderwidth=0,
         )
         vscroll = ttk.Scrollbar(
             container, orient=tk.VERTICAL, command=canvas.yview,
@@ -3671,15 +3890,32 @@ class App(tk.Tk):
 
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        def _on_mousewheel(event: Any) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        # Only scroll while the pointer is over this area; bind/unbind globally
-        # so the wheel still works no matter which child widget is hovered.
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        # Wheel scrolling is handled by one persistent application-wide
+        # binding (_on_global_mousewheel) that dispatches to the registered
+        # canvas under the pointer. Per-canvas bind_all/unbind_all pairs are
+        # deliberately avoided: unbind_all would nuke sibling panels' handler,
+        # and a binding left behind by a destroyed picker window would raise
+        # on the next wheel event anywhere in the app.
+        self._wheel_canvases.append(canvas)
 
         return container, inner
+
+    def _on_global_mousewheel(self, event: Any) -> None:
+        """Scroll the _make_scrollable canvas (if any) under the pointer."""
+        # Prune canvases whose windows have been destroyed (closed pickers).
+        self._wheel_canvases = [
+            c for c in self._wheel_canvases if c.winfo_exists()
+        ]
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            return
+        # Walk up from the hovered widget; scroll the first enclosing canvas.
+        while widget is not None:
+            if widget in self._wheel_canvases:
+                widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return
+            widget = getattr(widget, "master", None)
 
     def _make_output_area(self, parent: Any) -> tk.Text:
         """Create a scrollable text widget for command output."""
@@ -3790,6 +4026,15 @@ class App(tk.Tk):
         # SNMP tab is hidden (not locked) for non-FTD targets, so no lock flag
         self.snmp_run_btn.configure(state=state)
         self.snmp_cancel_btn.configure(state=cancel_state)
+        # Lock the source/target selectors while an operation runs - a
+        # mid-run platform switch would retitle/unlock tabs and clobber the
+        # running state. Restore each combo's idle state afterwards.
+        if state == tk.NORMAL:
+            self.source_combo.configure(state=self._source_combo_idle_state)
+            self.platform_combo.configure(state=self._platform_combo_idle_state)
+        else:
+            self.source_combo.configure(state=tk.DISABLED)
+            self.platform_combo.configure(state=tk.DISABLED)
 
     # ------------------------------------------------------------------
     # In-process execution engine
@@ -3817,6 +4062,13 @@ class App(tk.Tk):
         self._running = True
         self.status_var.set(f"Running: {label}...")
 
+        # Snapshot every secret as a plain string on the Tk main thread. Tk
+        # variables must never be read from the worker thread, so the worker
+        # scrubs exception text against this snapshot instead. argv secrets
+        # cover credentials with no Tk variable (e.g. the FTD->FG live-API
+        # password prompted via a dialog).
+        secrets = self._collect_secret_values() + _argv_secret_values(argv)
+
         def _worker() -> None:
             old_stdout, old_stderr = sys.stdout, sys.stderr
             writer = _QueueWriter(self._output_queue, text_widget)
@@ -3839,8 +4091,8 @@ class App(tk.Tk):
                 # surfacing the exception or traceback - defense in depth in
                 # case a future code path puts credentials into a URL or body
                 # that ends up in a network exception string.
-                err_text = self._scrub_secrets(str(exc))
-                tb_text = self._scrub_secrets(traceback.format_exc())
+                err_text = self._scrub_secrets(str(exc), secrets)
+                tb_text = self._scrub_secrets(traceback.format_exc(), secrets)
                 self._output_queue.put(
                     (text_widget, f"\n--- ERROR: {err_text} ---\n"),
                 )
@@ -3854,15 +4106,14 @@ class App(tk.Tk):
         self._worker_thread.start()
         self._poll_output()
 
-    def _scrub_secrets(self, text: str) -> str:
-        """Redact any operator passwords typed into the GUI from arbitrary text.
+    def _collect_secret_values(self) -> List[str]:
+        """Snapshot the credential fields as plain strings.
 
-        Used on exception strings and tracebacks before they are written to
-        the output window, so a network error that happens to embed
-        credentials in a URL never shows them in plaintext.
+        MUST be called on the Tk main thread - Tk variables are not safe to
+        read from worker threads. The returned list is handed to the worker,
+        which passes it to _scrub_secrets().
         """
-        if not text:
-            return text
+        secrets: List[str] = []
         for var_name in ("imp_pass_var", "cln_pass_var",
                          "snmp_pass_var", "snmp_auth_pw_var", "snmp_priv_pw_var"):
             var = getattr(self, var_name, None)
@@ -3872,7 +4123,24 @@ class App(tk.Tk):
                 pw = var.get()
             except tk.TclError:
                 continue
-            if pw and len(pw) >= 1:
+            if pw:
+                secrets.append(pw)
+        return secrets
+
+    @staticmethod
+    def _scrub_secrets(text: str, secrets: List[str]) -> str:
+        """Redact any operator passwords typed into the GUI from arbitrary text.
+
+        Used on exception strings and tracebacks before they are written to
+        the output window, so a network error that happens to embed
+        credentials in a URL never shows them in plaintext. ``secrets`` is a
+        plain-string snapshot taken on the main thread (thread-safe to use
+        from the worker).
+        """
+        if not text:
+            return text
+        for pw in secrets:
+            if pw:
                 text = text.replace(pw, "***REDACTED***")
         return text
 
@@ -3893,7 +4161,13 @@ class App(tk.Tk):
         self.after(50, self._poll_output)
 
     def _cancel_operation(self) -> None:
-        """Cancel the currently running operation by raising SystemExit in the worker thread."""
+        """Cancel the currently running operation by raising SystemExit in the worker thread.
+
+        Note: PyThreadState_SetAsyncExc only delivers the exception the next
+        time the worker executes Python bytecode - a blocking socket
+        connect/read cannot be interrupted, so cancellation takes effect at
+        the next API operation.
+        """
         if not self._running or self._worker_thread is None:
             return
         tid = self._worker_thread.ident
@@ -3905,11 +4179,37 @@ class App(tk.Tk):
         )
         if res == 0:
             return  # thread already finished
-        self.status_var.set("Cancelling...")
+        if res > 1:
+            # Per the CPython docs: if more than one thread state was
+            # modified, undo the damage with a second call passing exc=NULL.
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+            return
+        self.status_var.set(
+            "Cancelling... (takes effect at the worker's next operation; a "
+            "blocked network call cannot be interrupted)",
+        )
 
     # ------------------------------------------------------------------
     # Run commands
     # ------------------------------------------------------------------
+    def _validated_workers(self, raw: str) -> Optional[str]:
+        """Validate a Workers field as a whole number 1-32 (the range the FTD
+        CLIs accept). The ttk.Spinbox allows free text, so the value can't be
+        trusted. Returns the normalized string, or None after showing a
+        friendly error dialog."""
+        value = raw.strip()
+        try:
+            num = int(value)
+        except ValueError:
+            num = -1
+        if not 1 <= num <= 32:
+            messagebox.showerror(
+                "Invalid Workers",
+                f"Workers must be a whole number between 1 and 32 (got: {value or '(blank)'}).",
+            )
+            return None
+        return str(num)
+
     def _run_convert(self) -> None:
         is_asa = self._current_source == "Cisco ASA"
         is_pa_source = self._current_source == "Palo Alto"
@@ -3964,7 +4264,10 @@ class App(tk.Tk):
                 if not password:
                     messagebox.showerror("Missing Field", "Password cannot be empty.")
                     return
-                argv = ["--host", host, "--username", username, "--password", password,
+                # --flag=value form so credentials starting with '-' aren't
+                # mistaken for flags by argparse.
+                argv = [f"--host={host}", f"--username={username}",
+                        f"--password={password}",
                         "-o", full_base, "--no-ssl-verify"]
 
             self._run_in_thread(ftd_to_fg_convert_main, argv, self.conv_output, "Convert")
@@ -4080,11 +4383,13 @@ class App(tk.Tk):
         base = self.imp_base_var.get().strip() or ("pa_config" if is_pa else "ftd_config")
         full_base = os.path.join(impdir, base) if impdir else base
 
+        # Credential/host values use the --flag=value form so values starting
+        # with '-' aren't mistaken for flags by argparse.
         if is_pa:
             argv = [
-                "--host", host,
-                "--username", self.imp_user_var.get().strip() or "admin",
-                "--password", password,
+                f"--host={host}",
+                f"--username={self.imp_user_var.get().strip() or 'admin'}",
+                f"--password={password}",
                 "--input", full_base,
             ]
             if self.imp_deploy_var.get():
@@ -4094,12 +4399,15 @@ class App(tk.Tk):
 
             self._run_in_thread(pa_import_main, argv, self.imp_output, "Import (PAN-OS)")
         else:
+            workers = self._validated_workers(self.imp_workers_var.get())
+            if workers is None:
+                return
             argv = [
-                "--host", host,
-                "-u", self.imp_user_var.get().strip() or "admin",
-                "-p", password,
+                f"--host={host}",
+                f"--username={self.imp_user_var.get().strip() or 'admin'}",
+                f"--password={password}",
                 "--base", full_base,
-                "--workers", self.imp_workers_var.get(),
+                "--workers", workers,
             ]
 
             if self.imp_deploy_var.get():
@@ -4165,10 +4473,10 @@ class App(tk.Tk):
         the current theme's styles automatically.
         """
         glyph, glyph_fg = {
-            "info": ("ℹ", _ACCENT),     # information source
-            "warning": ("⚠", _ACCENT_H),  # warning sign
+            "info": ("ℹ", self._colors["accent"]),     # information source
+            "warning": ("⚠", self._colors["accent_h"]),  # warning sign
             "error": ("✖", "#ff6b6b"),  # heavy multiplication x
-        }.get(kind, ("ℹ", _ACCENT))
+        }.get(kind, ("ℹ", self._colors["accent"]))
 
         dlg = tk.Toplevel(self)
         dlg.title(title)
@@ -4286,7 +4594,16 @@ class App(tk.Tk):
             messagebox.showerror("Mismatch", "Passwords do not match.")
             return
 
-        set_password(new_pw)  # pyright: ignore[reportOptionalCall]
+        try:
+            set_password(new_pw)  # pyright: ignore[reportOptionalCall]
+        except OSError as exc:
+            # e.g. PermissionError when the app dir is read-only
+            messagebox.showerror(
+                "Could Not Save Password",
+                "Failed to write cleanup_auth.json next to the application:\n"
+                f"{exc}\n\nThe cleanup password was NOT changed.",
+            )
+            return
         self.cln_reset_pw_btn.configure(state=tk.NORMAL)
         messagebox.showinfo("Success", "Cleanup password has been changed.")
 
@@ -4309,7 +4626,15 @@ class App(tk.Tk):
         ):
             return
 
-        reset_to_default()  # pyright: ignore[reportOptionalCall]
+        try:
+            reset_to_default()  # pyright: ignore[reportOptionalCall]
+        except OSError as exc:
+            messagebox.showerror(
+                "Could Not Reset Password",
+                "Failed to remove cleanup_auth.json next to the application:\n"
+                f"{exc}\n\nThe cleanup password was NOT reset.",
+            )
+            return
         self.cln_reset_pw_btn.configure(state=tk.DISABLED)
         messagebox.showinfo("Success", "Cleanup password has been reset to default.")
 
@@ -4357,11 +4682,13 @@ class App(tk.Tk):
             messagebox.showerror("Missing Field", f"Please enter the {platform_label} password.")
             return
 
+        # Credential/host values use the --flag=value form so values starting
+        # with '-' aren't mistaken for flags by argparse.
         if is_pa:
             argv = [
-                "--host", host,
-                "--username", self.cln_user_var.get().strip() or "admin",
-                "--password", password,
+                f"--host={host}",
+                f"--username={self.cln_user_var.get().strip() or 'admin'}",
+                f"--password={password}",
             ]
 
             if self.cln_dry_var.get():
@@ -4379,14 +4706,14 @@ class App(tk.Tk):
                         "Please check 'Delete ALL' or select specific object types.",
                     )
                     return
+                # Map checkbox keys to the flags panos_api_cleanup.py actually
+                # defines. Keys with no PA flag are hidden/unchecked on the
+                # PAN-OS layout, so None lookups can't happen here - but skip
+                # them defensively anyway.
                 for key in selected:
-                    # Map FTD-style keys to PA cleanup flags
-                    pa_key_map = {
-                        "rules": "security-rules",
-                        "routes": "static-routes",
-                    }
-                    mapped = pa_key_map.get(key, key)
-                    argv.append(f"--delete-{mapped}")
+                    flag = CLEANUP_PA_FLAGS.get(key)
+                    if flag and flag not in argv:
+                        argv.append(flag)
 
             # Confirm before destructive cleanup
             if not self.cln_dry_var.get():
@@ -4400,12 +4727,15 @@ class App(tk.Tk):
 
             self._run_in_thread(pa_cleanup_main, argv, self.cln_output, "Cleanup (PAN-OS)")
         else:
+            workers = self._validated_workers(self.cln_workers_var.get())
+            if workers is None:
+                return
             argv = [
-                "--host", host,
-                "-u", self.cln_user_var.get().strip() or "admin",
-                "-p", password,
+                f"--host={host}",
+                f"--username={self.cln_user_var.get().strip() or 'admin'}",
+                f"--password={password}",
                 "--appliance-model", self.cln_model_var.get(),
-                "--workers", self.cln_workers_var.get(),
+                "--workers", workers,
                 "--yes",  # skip CLI interactive prompt (GUI has its own dialog)
             ]
 
@@ -4425,10 +4755,9 @@ class App(tk.Tk):
                     )
                     return
                 for key in selected:
-                    if key == "reset-physical-interfaces":
-                        argv.append("--reset-physical-interfaces")
-                    else:
-                        argv.append(f"--delete-{key}")
+                    flag = CLEANUP_FTD_FLAGS.get(key)
+                    if flag:
+                        argv.append(flag)
 
             # Confirm before destructive cleanup
             if not self.cln_dry_var.get():

@@ -29,7 +29,7 @@ FTD INTERFACE NAME RULES:
 import re
 from typing import Dict, List, Any, Set, Optional
 
-from common import collect_mgmt_ha_interfaces
+from common import collect_mgmt_ha_interfaces, first_item, netmask_to_cidr
 
 
 # =============================================================================
@@ -326,6 +326,15 @@ class InterfaceConverter:
         
         # Track used subinterface names to avoid duplicates
         self.used_subinterface_names = set()
+
+        # Track used physical interface names to avoid duplicates
+        # (two ports with the same alias would produce the same FTD name,
+        # and FDM rejects the second)
+        self.used_physical_names = set()
+
+        # FortiGate names that map to an EtherChannel FTD name; built once
+        # before VLAN conversion (was rebuilt per VLAN - O(n^2))
+        self._etherchannel_fg_names: Optional[Set[str]] = None
         
         # Track created security zone names to avoid duplicates
         self.created_zone_names = set()
@@ -1214,13 +1223,11 @@ class InterfaceConverter:
         return None
     
     def _netmask_to_cidr(self, netmask: str) -> int:
-        """Convert subnet mask to CIDR prefix length."""
-        try:
-            octets = netmask.split('.')
-            binary_str = ''.join(bin(int(octet))[2:].zfill(8) for octet in octets)
-            return binary_str.count('1')
-        except (ValueError, AttributeError):
-            return 24  # Default for malformed/non-numeric netmask
+        """Convert subnet mask to CIDR prefix length.
+
+        Shared implementation (warns and defaults to /32 on invalid input).
+        """
+        return netmask_to_cidr(netmask)
     
     def convert(self) -> Dict[str, List[Dict]]:
         """
@@ -1268,21 +1275,22 @@ class InterfaceConverter:
         vlan_interfaces = []  # Subinterfaces
         
         # Process system_switch-interface section for bridge groups
+        switch_interface_names = set()
         for switch_dict in switch_interfaces:
-            switch_name = list(switch_dict.keys())[0]
-            switch_props = switch_dict[switch_name]
-            
-            if isinstance(switch_props, dict):
-                switch_ports.append((switch_name, switch_props))
-        
+            item = first_item(switch_dict)
+            if item is None:
+                continue
+            switch_name, switch_props = item
+            switch_interface_names.add(str(switch_name))
+            switch_ports.append((switch_name, switch_props))
+
         # Process system_interface section
         for intf_dict in interfaces:
-            intf_name = list(intf_dict.keys())[0]
-            properties = intf_dict[intf_name]
-
-            # Skip non-dict entries
-            if not isinstance(properties, dict):
+            item = first_item(intf_dict)
+            if item is None:
+                # Skip empty/malformed entries (None properties, etc.)
                 continue
+            intf_name, properties = item
 
             # Silently ignore dedicated management and HA interfaces. These
             # are FortiGate infrastructure links (out-of-band mgmt, HA
@@ -1306,7 +1314,22 @@ class InterfaceConverter:
                 aggregate_ports.append((intf_name, properties))
             elif intf_type == 'physical':
                 physical_ports.append((intf_name, properties))
-            # Skip tunnel, loopback, etc.
+            elif intf_type == 'switch' and str(intf_name) in switch_interface_names:
+                # L3 shell of a virtual switch - converted as a bridge group
+                # from the system_switch-interface entry, so nothing to report.
+                continue
+            elif intf_type in ('tunnel', 'loopback'):
+                # No FTD equivalent (VPN topology / loopbacks are configured
+                # differently on FTD) - report instead of dropping silently.
+                print(f"    Skipped: {intf_name} (type '{intf_type}' - no FTD equivalent)")
+                self.stats['skipped'] += 1
+                self.failed_items.append({"name": str(intf_name), "reason": "no FTD equivalent", "config": properties})
+            else:
+                # switch (without a matching virtual switch), redundant,
+                # vdom-link, and anything unknown - report the skip.
+                print(f"    Skipped: {intf_name} (unsupported interface type '{intf_type}')")
+                self.stats['skipped'] += 1
+                self.failed_items.append({"name": str(intf_name), "reason": f"unsupported interface type '{intf_type}'", "config": properties})
         
         # ====================================================================
         # PHASE 2: Identify which physical interfaces have subinterfaces
@@ -1491,33 +1514,29 @@ class InterfaceConverter:
             self._convert_physical_interface(fg_name, properties)
         
         # PRIORITY 4: Convert standalone physical interfaces
-        # Only if we have ports left
+        # Only if we have ports left (interfaces pinned to a specific port via
+        # --map-port don't draw from the free pool, so they always convert)
         print("\n  [Priority 4] Converting Standalone Physical Interfaces...")
-        remaining_ports = len(self.available_ftd_ports)
-        if remaining_ports == 0 and len(physical_standalone) > 0:
-            print(f"    [WARNING] No ports remaining for {len(physical_standalone)} standalone interfaces")
-            for fg_name, props in physical_standalone:
-                print(f"      Skipped: {fg_name} (no ports available)")
+        if len(self.available_ftd_ports) == 0 and len(physical_standalone) > 0:
+            print(f"    [WARNING] No free ports remaining for standalone interfaces "
+                  f"(only explicitly mapped ones will convert)")
+        for fg_name, properties in physical_standalone:
+            if len(self.available_ftd_ports) == 0 and fg_name not in self.port_mapping:
+                print(f"    Skipped: {fg_name} (no ports available)")
                 self.stats['skipped'] += 1
-                self.failed_items.append({"name": fg_name, "reason": "no ports available", "config": props})
-        else:
-            for fg_name, properties in physical_standalone:
-                if len(self.available_ftd_ports) == 0:
-                    print(f"    Skipped: {fg_name} (no ports available)")
-                    self.stats['skipped'] += 1
-                    self.failed_items.append({"name": fg_name, "reason": "no ports available", "config": properties})
+                self.failed_items.append({"name": fg_name, "reason": "no ports available", "config": properties})
+            else:
+                # Promote to a new EtherChannel or bridge group if requested,
+                # otherwise convert as a standalone physical interface.
+                alias = properties.get('alias', fg_name)
+                ec_spec = self._get_promotion_spec(fg_name, alias)
+                bvi_spec = self._get_bridgegroup_promotion_spec(fg_name, alias)
+                if ec_spec is not None:
+                    self._promote_physical_to_etherchannel(fg_name, properties, ec_spec)
+                elif bvi_spec is not None:
+                    self._promote_physical_to_bridgegroup(fg_name, properties, bvi_spec)
                 else:
-                    # Promote to a new EtherChannel or bridge group if requested,
-                    # otherwise convert as a standalone physical interface.
-                    alias = properties.get('alias', fg_name)
-                    ec_spec = self._get_promotion_spec(fg_name, alias)
-                    bvi_spec = self._get_bridgegroup_promotion_spec(fg_name, alias)
-                    if ec_spec is not None:
-                        self._promote_physical_to_etherchannel(fg_name, properties, ec_spec)
-                    elif bvi_spec is not None:
-                        self._promote_physical_to_bridgegroup(fg_name, properties, bvi_spec)
-                    else:
-                        self._convert_physical_interface(fg_name, properties)
+                    self._convert_physical_interface(fg_name, properties)
         
         # PHASE 5: Convert VLAN interfaces (Subinterfaces)
         # These don't need additional ports - they use parent interfaces
@@ -1743,13 +1762,25 @@ class InterfaceConverter:
             port_num = ftd_hardware.split('/')[-1] if '/' in ftd_hardware else '1'
             ftd_name = f"{ftd_name}_port{port_num}"
             print(f"      Note: '{original_reserved}' is reserved, renamed to '{ftd_name}'")
-        
+
+        # Check for duplicate names (e.g., two ports sharing an alias) and
+        # make unique - FDM rejects a second interface with the same name
+        base_ftd_name = ftd_name
+        counter = 2
+        while ftd_name in self.used_physical_names:
+            ftd_name = f"{base_ftd_name}_{counter}"
+            counter += 1
+        if ftd_name != base_ftd_name:
+            print(f"      Note: name '{base_ftd_name}' already used, renamed to '{ftd_name}'")
+        self.used_physical_names.add(ftd_name)
+
         # Get description
         description = properties.get('description', alias)
-        
-        # Store the mapping
+
+        # Store the mapping (fg_name follows the deduplicated name; the alias
+        # keeps pointing at its first interface so references stay consistent)
         self.interface_name_mapping[fg_name] = ftd_name
-        self.interface_name_mapping[alias] = ftd_name
+        self.interface_name_mapping.setdefault(alias, ftd_name)
         
         # Build FTD physical interface payload (for PUT)
         ftd_interface = {
@@ -2281,7 +2312,52 @@ class InterfaceConverter:
         # Build FTD name from both alias and fg_name for clarity
         # Example: alias="L-slap", fg_name="551" -> "l_slap_551"
         alias = properties.get('alias', '')
-        
+
+        # Resolve the parent's FTD hardware name FIRST - if the parent never
+        # got an FTD port, the VLAN must be skipped (a fallback like
+        # Ethernet1/1 would attach it to the wrong physical port).
+        parent_ftd_name = self.interface_name_mapping.get(parent_fg_name)
+
+        # Build the set of FortiGate aggregate interface names once (Phase 5
+        # runs after all EtherChannels are created, so caching is safe).
+        if self._etherchannel_fg_names is None:
+            ec_ftd_names = {ec.get('name', '') for ec in self.etherchannels}
+            self._etherchannel_fg_names = {
+                fg_name_key
+                for fg_name_key, ftd_name_val in self.interface_name_mapping.items()
+                if ftd_name_val in ec_ftd_names
+            }
+        etherchannel_fg_names = self._etherchannel_fg_names
+
+        # Determine hardware name based on parent type.
+        # Also classify the parent for VLAN conflict resolution: subinterfaces
+        # on etherchannels and virtual switches (bridge groups) keep their
+        # VLAN IDs; physical-parent subinterfaces may be remapped on conflict.
+        bridge_group_names = {bg.get('name') for bg in self.bridge_groups}
+        if parent_fg_name in etherchannel_fg_names:
+            parent_class = 'etherchannel'
+            # Parent is an etherchannel - find its hardware name
+            parent_hardware = None
+            for ec in self.etherchannels:
+                if parent_ftd_name == ec.get('name'):
+                    parent_hardware = ec.get('hardwareName')
+                    break
+        else:
+            parent_class = 'bridge' if parent_ftd_name in bridge_group_names else 'physical'
+            # Parent is a physical interface
+            parent_hardware = self.port_mapping.get(parent_fg_name)
+
+        if not parent_hardware:
+            print(f"    Skipped: {fg_name} (parent interface '{parent_fg_name}' "
+                  f"has no FTD port - VLAN cannot be attached)")
+            self.stats['skipped'] += 1
+            self.failed_items.append({
+                "name": fg_name,
+                "reason": f"parent interface '{parent_fg_name}' has no FTD port mapping",
+                "config": properties,
+            })
+            return
+
         if alias and alias != fg_name:
             # Combine alias and fg_name: "alias_fgname"
             combined_name = f"{alias}_{fg_name}"
@@ -2320,39 +2396,6 @@ class InterfaceConverter:
         self.interface_name_mapping[fg_name] = ftd_name
         if alias and alias != fg_name:
             self.interface_name_mapping[alias] = ftd_name
-        
-        # Determine parent FTD interface
-        # Could be physical or etherchannel
-        parent_ftd_name = self.interface_name_mapping.get(parent_fg_name)
-        
-        # Build set of FortiGate aggregate interface names for efficient lookup
-        # This includes the original FortiGate name that maps to each etherchannel
-        etherchannel_fg_names = set()
-        for ec in self.etherchannels:
-            ec_ftd_name = ec.get('name', '')
-            # Find all FortiGate names that map to this etherchannel's FTD name
-            for fg_name_key, ftd_name_val in self.interface_name_mapping.items():
-                if ftd_name_val == ec_ftd_name:
-                    etherchannel_fg_names.add(fg_name_key)
-        
-        # Determine hardware name based on parent type.
-        # Also classify the parent for VLAN conflict resolution: subinterfaces
-        # on etherchannels and virtual switches (bridge groups) keep their
-        # VLAN IDs; physical-parent subinterfaces may be remapped on conflict.
-        bridge_group_names = {bg.get('name') for bg in self.bridge_groups}
-        if parent_fg_name in etherchannel_fg_names:
-            parent_class = 'etherchannel'
-            # Parent is an etherchannel - find its hardware name
-            for ec in self.etherchannels:
-                if parent_ftd_name == ec.get('name'):
-                    parent_hardware = ec.get('hardwareName', 'Port-channel1')
-                    break
-            else:
-                parent_hardware = 'Port-channel1'  # Default fallback
-        else:
-            parent_class = 'bridge' if parent_ftd_name in bridge_group_names else 'physical'
-            # Parent is a physical interface
-            parent_hardware = self.port_mapping.get(parent_fg_name, "Ethernet1/1")
 
         hardware_name = f"{parent_hardware}.{vlan_id}"
 

@@ -25,6 +25,10 @@ FORTIGATE YAML FORMAT:
             tcp-portrange: 80-443  # Port range
             tcp-portrange: [80, 443, 8080]  # Multiple ports (list)
             tcp-portrange: [80-443, 8080-8090]  # Multiple ranges (list)
+            tcp-portrange: 443:1024-65535  # Destination 443 restricted to
+                                           # SOURCE ports 1024-65535 (the
+                                           # source part cannot be migrated
+                                           # to FTD port objects)
 
 CONVERSION EXAMPLES:
     FortiGate: LR_CLUST with tcp-portrange: [8300-8301, 8500-8501, 8086]
@@ -43,9 +47,9 @@ FTD JSON OUTPUT FORMAT:
     }
 """
 
-from typing import Dict, List, Any, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 
-from common import sanitize_name, is_default_fortigate_service
+from common import sanitize_name, is_default_fortigate_service, first_item, dedupe_name
 
 # FTD System-Defined Services - these names are reserved and cannot be used
 # If a FortiGate service has the same name, we'll add "_Custom" suffix
@@ -141,9 +145,9 @@ class ServiceConverter:
         self.icmp_port_objects: List[Dict] = []
         self.ping_group: Dict = {}
 
-        # Mapping of FortiGate service name -> list of FTD object names created
+        # Mapping of FortiGate service name -> list of (FTD name, type) tuples
         # Used by ServiceGroupConverter to expand group members correctly
-        self.service_name_mapping = {}
+        self.service_name_mapping: Dict[str, List[Tuple[str, str]]] = {}
         # Set of service names that were skipped (ICMP, etc.)
         # Used by ServiceGroupConverter to filter these out of groups
         self.skipped_services = set()
@@ -151,58 +155,62 @@ class ServiceConverter:
         # Track items that failed/were skipped during conversion
         self.failed_items = []
     
-    def _parse_port_list(self, port_value: Any) -> List[str]:
+    def _parse_port_list(self, port_value: Any, service_name: Optional[str] = None) -> List[str]:
         """
         Parse FortiGate port value into a list of individual ports/ranges.
-        
+
         FortiGate can specify ports as:
         - Single int: 80
         - Single string: "80" or "80-443"
-        - Colon-separated string: "80:443:8080" or "80-90:443-445"
+        - String with source-port restriction: "443:1024-65535"
+          (DESTINATION port(s) before the colon, SOURCE port(s) after it)
         - List: [80, 443, 8080] or ["80-90", "443-445"]
         - List of mixed: [8300-8301, 8500-8501, 8086]
-        
+
+        FTD port objects cannot express FortiGate source-port restrictions.
+        The destination part before ':' is converted; the source part is
+        DROPPED and recorded in failed_items so the loss is visible (dropping
+        only the source restriction never broadens the destination match).
+
         Args:
             port_value: The port value from FortiGate config
-            
+            service_name: Original service name (for failed_items reporting)
+
         Returns:
             List of individual port strings (each suitable for one FTD object)
         """
         if port_value is None:
             return []
-        
-        ports = []
-        
-        # Case 1: It's a list
+
+        def _dest_only(item_str: str) -> str:
+            """Strip a 'dst:src' source-port restriction, keeping the dst part."""
+            if ':' not in item_str:
+                return item_str
+            dst_part, src_part = item_str.split(':', 1)
+            dst_part = dst_part.strip()
+            src_part = src_part.strip()
+            print(f"    Warning: {service_name or 'service'} port range '{item_str}' has a "
+                  f"source-port restriction - keeping destination '{dst_part}', "
+                  f"dropping source ports '{src_part}'")
+            self.failed_items.append({
+                "name": service_name or "unknown",
+                "reason": f"source-port restriction not migrated "
+                          f"(kept destination port(s) '{dst_part}', dropped source port(s) '{src_part}')",
+                "config": {"portrange": item_str},
+            })
+            return dst_part
+
+        # Normalize to a list of raw string tokens
         if isinstance(port_value, list):
-            for item in port_value:
-                # Each item could be an int, a string with a single port/range,
-                # or a string with colon-separated ports
-                item_str = str(item)
-                if ':' in item_str:
-                    # Split colon-separated values
-                    ports.extend(item_str.split(':'))
-                else:
-                    ports.append(item_str)
-        
-        # Case 2: It's a string (possibly colon-separated)
-        elif isinstance(port_value, str):
-            if ':' in port_value:
-                ports = port_value.split(':')
-            else:
-                ports = [port_value]
-        
-        # Case 3: It's a single integer
-        elif isinstance(port_value, int):
-            ports = [str(port_value)]
-        
-        # Case 4: Something else - convert to string
+            raw_items = [str(item) for item in port_value]
         else:
-            ports = [str(port_value)]
-        
+            raw_items = [str(port_value)]
+
+        ports = [_dest_only(item) for item in raw_items]
+
         # Clean up each port (strip whitespace)
         ports = [p.strip() for p in ports if p.strip()]
-        
+
         return ports
     
     def _is_ping_service(self, service_name: str, properties: Dict[str, Any],
@@ -210,9 +218,11 @@ class ServiceConverter:
         """
         Decide whether a FortiGate service is an ICMP "ping" (echo) service.
 
-        A service qualifies as ping if it is named PING, or if it is an ICMP
-        (not ICMPv6) service whose icmptype is 8 (echo request). FortiGate stores
-        the predefined PING service as protocol ICMP with icmptype 8.
+        A service qualifies as ping only if it actually IS an ICMPv4 service:
+        either named PING with an ICMP protocol, or any ICMP service whose
+        icmptype is 8 (echo request). FortiGate stores the predefined PING
+        service as protocol ICMP with icmptype 8. A TCP/UDP service that merely
+        happens to be named "ping" is NOT converted to ICMP objects.
 
         Args:
             service_name: Original FortiGate service name
@@ -223,13 +233,13 @@ class ServiceConverter:
         Returns:
             True if this service should be migrated as the PING port group.
         """
-        if sanitize_name(service_name).upper() == PING_GROUP_NAME:
-            return True
-
         # ICMPv4 only (protocol 1). ICMPv6 (58) is left for the normal skip path.
-        is_icmpv4 = protocol == 'ICMP' or protocol_number in (1, '1')
+        is_icmpv4 = protocol in ('ICMP', 'PING') or protocol_number in (1, '1')
         if not is_icmpv4:
             return False
+
+        if sanitize_name(service_name).upper() == PING_GROUP_NAME:
+            return True
 
         # icmptype 8 == echo request == ping. Compare loosely (int or string).
         icmptype = properties.get('icmptype', properties.get('icmp-type'))
@@ -325,9 +335,13 @@ class ServiceConverter:
             # ================================================================
             # STEP 2A: Extract the service name and properties
             # ================================================================
-            service_name = list(service_dict.keys())[0]
-            properties = service_dict[service_name]
-            sanitized_name = sanitize_name(service_name)
+            item = first_item(service_dict)
+            if item is None:
+                print("  Skipped: empty/malformed service entry")
+                continue
+            service_name, properties = item
+            base_name = sanitize_name(service_name)
+            sanitized_name = base_name
 
             # Silently ignore FortiGate factory-default services (e.g. "ALL").
             # These exist on every appliance and are not meaningful to migrate,
@@ -339,16 +353,13 @@ class ServiceConverter:
                 continue
 
             # Deduplicate: if this base name was already used, append _2, _3, etc.
-            if sanitized_name in used_names:
-                used_names[sanitized_name] += 1
-                sanitized_name = f"{sanitized_name}_{used_names[sanitized_name]}"
-            else:
-                used_names[sanitized_name] = 1
+            # (generated names are registered so a literal X_2 can't collide)
+            sanitized_name = dedupe_name(base_name, used_names)
 
             # ================================================================
             # STEP 2B: Check the protocol type
             # ================================================================
-            protocol = properties.get('protocol', '').upper()
+            protocol = str(properties.get('protocol', '')).upper()
             protocol_number = properties.get('protocol-number', None)
 
             # ============================================================
@@ -361,6 +372,9 @@ class ServiceConverter:
             if self._is_ping_service(service_name, properties, protocol, protocol_number):
                 ping_members = self._ensure_ping_objects()
                 self.service_name_mapping[sanitized_name] = ping_members
+                if base_name != sanitized_name:
+                    # Renamed on collision: keep the original-name lookup working
+                    self.service_name_mapping.setdefault(base_name, ping_members)
                 self.ping_service_count += 1
                 print(f"  Converted: {service_name} -> {PING_GROUP_NAME} group "
                       f"(ICMP echo request + echo reply)")
@@ -395,8 +409,8 @@ class ServiceConverter:
             # ================================================================
             # STEP 2C: Parse TCP and UDP port lists
             # ================================================================
-            tcp_ports = self._parse_port_list(properties.get('tcp-portrange', None))
-            udp_ports = self._parse_port_list(properties.get('udp-portrange', None))
+            tcp_ports = self._parse_port_list(properties.get('tcp-portrange', None), service_name)
+            udp_ports = self._parse_port_list(properties.get('udp-portrange', None), service_name)
             
             # ================================================================
             # STEP 2D: Create FTD port objects
@@ -490,6 +504,10 @@ class ServiceConverter:
             
             # Store the mapping of FortiGate name -> FTD names
             self.service_name_mapping[sanitized_name] = ftd_object_info
+            if base_name != sanitized_name:
+                # Renamed on collision: keep the original-name lookup working
+                # (first occurrence wins - setdefault won't overwrite it)
+                self.service_name_mapping.setdefault(base_name, ftd_object_info)
             
             # ================================================================
             # STEP 2E: Print conversion details
@@ -529,26 +547,28 @@ class ServiceConverter:
             Dictionary with counts of TCP, UDP, split, and skipped services
         """
         return {
+            # total = tcp + udp + icmp (ping echo objects are counted separately)
             "total_objects": len(self.ftd_port_objects),
             "tcp_objects": self.tcp_count,
             "udp_objects": self.udp_count,
+            "icmp_objects": len(self.icmp_port_objects),  # ICMPv4 echo objects for ping
             "split_services": self.split_count,  # Services with both TCP and UDP
             "multi_port_services": self.multi_port_split_count,  # Services with multiple ports
             "skipped_services": self.skipped_count,  # Services with no ports defined
             "icmp_skipped": self.icmp_skipped_count,  # ICMP and other non-port protocols
             "ping_services": self.ping_service_count  # ICMP ping services -> PING group
         }
-    
-    def get_service_name_mapping(self) -> Dict[str, List[str]]:
+
+    def get_service_name_mapping(self) -> Dict[str, List[Tuple[str, str]]]:
         """
-        Get a mapping of original FortiGate service names to FTD object names.
-        
+        Get a mapping of original FortiGate service names to FTD objects.
+
         This is used by the ServiceGroupConverter to expand group members
         to the correct FTD object names.
-        
+
         Returns:
-            Dict mapping FortiGate service name -> list of FTD object names
-            Example: {"LR_CLUST": ["LR_CLUST_TCP_1", "LR_CLUST_TCP_2", "LR_CLUST_UDP_3"]}
+            Dict mapping FortiGate service name -> list of (FTD name, type) tuples
+            Example: {"DNS": [("DNS_TCP", "tcpportobject"), ("DNS_UDP", "udpportobject")]}
         """
         return self.service_name_mapping
     

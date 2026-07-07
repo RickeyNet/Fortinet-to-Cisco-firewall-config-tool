@@ -6,8 +6,9 @@ Orchestrates the conversion of a PAN-OS XML running configuration to
 FortiGate CLI config format.
 
 The output is a single ``.conf`` file containing FortiGate CLI commands
-that can be pasted directly into the FortiGate CLI or restored via:
-    System > Configuration > Restore (select the .conf file)
+intended to be pasted into the FortiGate CLI.  The file has no
+``#config-version=`` header, so the web UI restore feature will reject
+it - use the CLI paste workflow.
 
 OUTPUT FILE:
     {output_base}.conf    - FortiGate CLI configuration
@@ -29,8 +30,7 @@ HOW TO RUN:
 
 NOTE:
     Direct API import to FortiGate is not currently supported.
-    Apply the generated .conf file using the FortiGate CLI or
-    the web UI backup/restore feature.
+    Apply the generated .conf file by pasting it into the FortiGate CLI.
 """
 
 import argparse
@@ -97,8 +97,11 @@ Examples:
     )
     parser.add_argument(
         "--vsys",
-        help="Target vsys to parse (default: vsys1)",
-        default="vsys1",
+        help=(
+            "Target vsys to parse by name (default: vsys1, falling back "
+            "to the first vsys found)"
+        ),
+        default=None,
     )
 
     args = parser.parse_args(argv)
@@ -118,8 +121,10 @@ Examples:
     # STEP 3: Parse PAN-OS XML
     # ====================================================================
     print(f"\nLoading PAN-OS XML configuration from: {args.input_file}")
+    if args.vsys:
+        print(f"Target vsys: {args.vsys}")
     try:
-        pa_config = parse_panos_xml(args.input_file)
+        pa_config = parse_panos_xml(args.input_file, vsys_name=args.vsys)
         print("[OK] PAN-OS XML parsed successfully")
     except Exception as exc:
         print(f"[ERROR] Failed to parse XML: {exc}")
@@ -137,6 +142,17 @@ Examples:
         f"{len(pa_config.get('zones', []))} zones, "
         f"{len(pa_config.get('interfaces', []))} interfaces"
     )
+
+    # Report entries the parser had to skip (unsupported types)
+    parse_skipped = pa_config.get("parse_skipped", {})
+    for kind, names in parse_skipped.items():
+        if names:
+            preview = ", ".join(names[:5])
+            suffix = ", ..." if len(names) > 5 else ""
+            print(
+                f"  Warning: {len(names)} {kind} skipped during parse "
+                f"(unsupported type): {preview}{suffix}"
+            )
 
     # ====================================================================
     # STEP 4: Run conversion phases
@@ -179,12 +195,25 @@ Examples:
     # Phase 3: Address groups                                              #
     # ------------------------------------------------------------------ #
     print("\n[Phase 3/7] Converting address groups...")
-    addrgrp_converter = FGAddressGroupConverter(pa_config)
+    addrgrp_converter = FGAddressGroupConverter(
+        pa_config,
+        address_name_map=addr_converter.get_name_map(),
+        skipped_addresses=addr_converter.get_skipped_names(),
+    )
     addrgrp_block = addrgrp_converter.convert()
     if addrgrp_block:
         output_sections.append(addrgrp_block)
     stats = addrgrp_converter.get_statistics()
     print(f"  Result: {stats['total']} converted, {stats['skipped']} skipped")
+
+    # Combined address maps for policy reference fixup (objects + groups)
+    address_name_map = {
+        **addr_converter.get_name_map(),
+        **addrgrp_converter.get_name_map(),
+    }
+    skipped_addresses = (
+        addr_converter.get_skipped_names() | addrgrp_converter.get_skipped_names()
+    )
 
     # ------------------------------------------------------------------ #
     # Phase 4: Service objects                                             #
@@ -207,18 +236,39 @@ Examples:
     # Phase 5: Service groups                                              #
     # ------------------------------------------------------------------ #
     print("\n[Phase 5/7] Converting service groups...")
-    svcgrp_converter = FGServiceGroupConverter(pa_config, service_name_map)
+    svcgrp_converter = FGServiceGroupConverter(
+        pa_config,
+        service_name_map,
+        skipped_services=svc_converter.get_skipped_names(),
+        merged_pairs=svc_converter.get_merged_pairs(),
+    )
     svcgrp_block = svcgrp_converter.convert()
     if svcgrp_block:
         output_sections.append(svcgrp_block)
     stats = svcgrp_converter.get_statistics()
     print(f"  Result: {stats['total']} converted, {stats['skipped']} skipped")
 
+    # Combined service maps for policy reference fixup (objects + groups)
+    combined_service_map = {
+        **service_name_map,
+        **svcgrp_converter.get_name_map(),
+    }
+    skipped_services = (
+        svc_converter.get_skipped_names() | svcgrp_converter.get_skipped_names()
+    )
+
     # ------------------------------------------------------------------ #
     # Phase 6: Security policies                                           #
     # ------------------------------------------------------------------ #
     print("\n[Phase 6/7] Converting security policies...")
-    policy_converter = FGPolicyConverter(pa_config, service_name_map)
+    policy_converter = FGPolicyConverter(
+        pa_config,
+        combined_service_map,
+        address_name_map=address_name_map,
+        skipped_services=skipped_services,
+        skipped_addresses=skipped_addresses,
+        merged_service_pairs=svc_converter.get_merged_pairs(),
+    )
     policy_block = policy_converter.convert()
     if policy_block:
         output_sections.append(policy_block)
@@ -226,20 +276,24 @@ Examples:
     print(
         f"  Result: {stats['total']} converted "
         f"({stats['allow']} allow, {stats['deny']} deny, "
-        f"{stats['disabled']} disabled)"
+        f"{stats['disabled']} disabled, "
+        f"{stats['fail_closed']} disabled fail-closed)"
     )
 
     # ------------------------------------------------------------------ #
     # Phase 7: Static routes                                               #
     # ------------------------------------------------------------------ #
     print("\n[Phase 7/7] Converting static routes...")
-    route_converter = FGRouteConverter(pa_config)
+    route_converter = FGRouteConverter(
+        pa_config,
+        interface_name_map=intf_converter.get_interface_name_map(),
+    )
     route_block = route_converter.convert()
     if route_block:
         output_sections.append(route_block)
     stats = route_converter.get_statistics()
     print(
-        f"  Result: {stats['converted']} converted, "
+        f"  Result: {stats['converted']} of {stats['total']} converted, "
         f"{stats['skipped']} skipped"
     )
 
@@ -258,7 +312,9 @@ Examples:
         f"#\n"
         f"# IMPORTANT: Review all settings before applying.\n"
         f"# Interface-to-port assignments must be verified manually.\n"
-        f"# Apply via FortiGate CLI or: System > Configuration > Restore\n"
+        f"# Apply by pasting into the FortiGate CLI. This file has no\n"
+        f"# #config-version= header, so the web UI restore feature\n"
+        f"# (System > Configuration > Restore) will NOT accept it.\n"
         f"#\n\n"
     )
 
@@ -281,8 +337,10 @@ Examples:
     print(
         "\nNext steps:\n"
         "  1. Review the generated .conf file carefully\n"
-        "  2. Verify interface names match your FortiGate hardware ports\n"
-        "  3. Apply via FortiGate CLI or web UI (System > Configuration > Restore)\n"
+        "  2. Map the commented physical-interface guidance to your\n"
+        "     FortiGate hardware ports (and fix VLAN parent references)\n"
+        "  3. Apply by pasting into the FortiGate CLI (the web UI restore\n"
+        "     feature is not supported for this file)\n"
         "  4. Test all firewall policies and routing after applying"
     )
     print("=" * 60)

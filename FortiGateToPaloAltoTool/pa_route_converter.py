@@ -20,7 +20,7 @@ Output JSON:
 
 from typing import Any, Dict, List, Optional
 
-from pa_common import sanitize_name, netmask_to_cidr
+from pa_common import sanitize_name, netmask_to_cidr, first_item, dedup_name
 
 
 class PARouteConverter:
@@ -61,10 +61,25 @@ class PARouteConverter:
         used_names: Dict[str, int] = {}
 
         for route_dict in routes:
-            route_id = list(route_dict.keys())[0]
-            properties = route_dict[route_id]
+            item = first_item(route_dict)
+            if item is None:
+                continue
+            route_id, properties = item
 
             self._stats["total_routes"] += 1
+
+            # --- Skip disabled routes ---
+            status = str(properties.get("status", "enable")).strip().lower()
+            if status in ("disable", "disabled"):
+                self._stats["other_skipped"] += 1
+                self.failed_items.append({
+                    "name": f"Route_{route_id}",
+                    "reason": "route is disabled on the FortiGate (status: disable) "
+                              "- not migrated",
+                    "config": properties,
+                })
+                print(f"  Skipped: Route {route_id} (disabled)")
+                continue
 
             # --- Skip blackhole routes ---
             blackhole = str(properties.get("blackhole", "")).strip().lower()
@@ -75,6 +90,12 @@ class PARouteConverter:
 
             # --- Destination ---
             destination = self._extract_destination(properties)
+            if not destination and "dst" not in properties and \
+                    str(properties.get("gateway", "")).strip() not in ("", "0.0.0.0"):
+                # FortiGate omits `set dst` for default routes (0.0.0.0/0 is
+                # the field's default value). A gateway with no dst is clearly
+                # the default route; anything else stays skipped below.
+                destination = "0.0.0.0/0"
             if not destination:
                 self._stats["other_skipped"] += 1
                 self.failed_items.append({
@@ -213,10 +234,4 @@ class PARouteConverter:
         if not sanitized:
             sanitized = f"route_{route_id}"
 
-        if sanitized in used_names:
-            used_names[sanitized] += 1
-            sanitized = f"{sanitized}_{used_names[sanitized]}"
-        else:
-            used_names[sanitized] = 1
-
-        return sanitized
+        return dedup_name(sanitized, used_names)

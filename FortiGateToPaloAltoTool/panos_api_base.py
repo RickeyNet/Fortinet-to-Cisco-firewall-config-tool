@@ -125,7 +125,7 @@ class PANOSBaseClient:
 
             # Parse error message - never fall through to raw resp.text since
             # PAN-OS error replies sometimes echo submitted parameters.
-            msg_elem = root.find(".//msg") or root.find(".//line")
+            msg_elem = self._find_msg_elem(root)
             msg = msg_elem.text if msg_elem is not None else "auth failed"
             print(f"[FAIL] Authentication failed: {msg}")
             return False
@@ -138,10 +138,26 @@ class PANOSBaseClient:
             return False
 
     def _scrub_secrets(self, text: str) -> str:
-        """Remove the configured password from arbitrary text before logging."""
-        if self.password and text:
-            return text.replace(self.password, "***REDACTED***")
+        """Remove the password and API key from arbitrary text before logging."""
+        if not text:
+            return text
+        if self.password:
+            text = text.replace(self.password, "***REDACTED***")
+        if self.api_key:
+            text = text.replace(self.api_key, "***REDACTED***")
         return text
+
+    @staticmethod
+    def _find_msg_elem(root: ET.Element):
+        """Return the <msg> element, falling back to <line>.
+
+        Uses explicit ``is not None`` checks - Elements without children are
+        falsy, so ``find(...) or find(...)`` would drop a present <msg>.
+        """
+        msg_elem = root.find(".//msg")
+        if msg_elem is None:
+            msg_elem = root.find(".//line")
+        return msg_elem
 
     # ------------------------------------------------------------------
     # Configuration operations
@@ -162,9 +178,49 @@ class PANOSBaseClient:
         """Get configuration at the given XPath (candidate config).
 
         Returns:
-            (success, response_xml)
+            (success, message) - like all _config_request wrappers this
+            returns the <msg>/<line> text ("OK" for a successful get). Use
+            :meth:`config_get_xml` when the actual configuration XML is needed.
         """
         return self._config_request("get", xpath)
+
+    def config_get_xml(self, xpath: str) -> Tuple[bool, str]:
+        """Get configuration at the given XPath, returning the raw response XML.
+
+        Unlike ``config_get()``, the full API response body is returned so
+        callers can parse the ``<entry>`` elements inside ``<result>``.
+
+        Returns:
+            (success, raw_response_xml_or_error_message)
+        """
+        if not self.api_key:
+            return False, "Not authenticated"
+
+        params: Dict[str, str] = {
+            "type": "config",
+            "action": "get",
+            "xpath": xpath,
+            "key": self.api_key,
+        }
+
+        try:
+            resp = self.session.post(self.base_url, data=params, timeout=120)
+
+            if resp.status_code != 200:
+                return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+            root = ET.fromstring(resp.text)
+            if root.attrib.get("status", "") == "success":
+                return True, resp.text
+
+            msg_elem = self._find_msg_elem(root)
+            msg = msg_elem.text if msg_elem is not None and msg_elem.text else ""
+            return False, msg or resp.text[:200]
+
+        except ET.ParseError as e:
+            return False, f"XML parse error: {e}"
+        except requests.exceptions.RequestException as e:
+            return False, f"Request error: {self._scrub_secrets(str(e))}"
 
     def config_delete(self, xpath: str) -> Tuple[bool, str]:
         """Delete configuration at the given XPath.
@@ -200,7 +256,7 @@ class PANOSBaseClient:
 
             root = ET.fromstring(resp.text)
             status = root.attrib.get("status", "")
-            msg_elem = root.find(".//msg") or root.find(".//line")
+            msg_elem = self._find_msg_elem(root)
             msg = msg_elem.text if msg_elem is not None else ""
 
             if status == "success":
@@ -275,9 +331,11 @@ class PANOSBaseClient:
             time.sleep(poll_interval)
 
             try:
-                resp = self.session.get(
+                # POST the API key in the form body, never in the URL query
+                # string (it would land in proxy/webserver logs).
+                resp = self.session.post(
                     self.base_url,
-                    params={
+                    data={
                         "type": "op",
                         "cmd": f"<show><jobs><id>{job_id}</id></jobs></show>",
                         "key": self.api_key,
@@ -346,9 +404,10 @@ class PANOSBaseClient:
         print(f"{'=' * 60}")
 
         try:
-            resp = self.session.get(
+            # POST the API key in the form body, never in the URL query string.
+            resp = self.session.post(
                 self.base_url,
-                params={
+                data={
                     "type": "op",
                     "cmd": "<show><system><info></info></system></show>",
                     "key": self.api_key,
@@ -383,7 +442,7 @@ class PANOSBaseClient:
             # parameters. Extract the <msg>/<line> element if available.
             try:
                 root = ET.fromstring(resp.text)
-                msg_elem = root.find(".//msg") or root.find(".//line")
+                msg_elem = self._find_msg_elem(root)
                 msg = msg_elem.text if msg_elem is not None and msg_elem.text else "unexpected response"
             except ET.ParseError:
                 msg = "unexpected response"

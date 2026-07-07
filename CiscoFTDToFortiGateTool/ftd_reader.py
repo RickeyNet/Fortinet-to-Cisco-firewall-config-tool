@@ -67,13 +67,17 @@ class FTDReader(FTDBaseClient):
 
             data = response.json()
             page = data.get("items", [])
+            if not page:
+                break
             items.extend(page)
 
             paging = data.get("paging", {})
-            total = paging.get("count", len(page))
-            if offset + limit >= total:
+            total = paging.get("count", len(items))
+            if len(items) >= total:
                 break
-            offset += limit
+            # Advance by the actual page size (servers may return fewer
+            # items than requested, which would otherwise skip objects).
+            offset += len(page)
 
         return items
 
@@ -103,6 +107,18 @@ class FTDReader(FTDBaseClient):
         print(f"    → {len(result)} objects")
         return result
 
+    def read_icmpv4_ports(self) -> List[Dict]:
+        print("  Fetching ICMPv4 port objects (/object/icmpv4ports)...")
+        result = self._fetch_all("/object/icmpv4ports")
+        print(f"    → {len(result)} objects")
+        return result
+
+    def read_icmpv6_ports(self) -> List[Dict]:
+        print("  Fetching ICMPv6 port objects (/object/icmpv6ports)...")
+        result = self._fetch_all("/object/icmpv6ports")
+        print(f"    → {len(result)} objects")
+        return result
+
     def read_port_groups(self) -> List[Dict]:
         print("  Fetching service groups (/object/portgroups)...")
         result = self._fetch_all("/object/portgroups")
@@ -120,6 +136,31 @@ class FTDReader(FTDBaseClient):
         result = self._fetch_all("/devices/default/etherchannelinterfaces")
         print(f"    → {len(result)} EtherChannels")
         return result
+
+    def read_subinterfaces(
+        self,
+        physical_interfaces: List[Dict],
+        etherchannel_interfaces: List[Dict],
+    ) -> List[Dict]:
+        """Fetch VLAN subinterfaces.
+
+        FDM exposes subinterfaces only under per-parent endpoints:
+            /devices/default/interfaces/{parentId}/subinterfaces
+            /devices/default/etherchannelinterfaces/{parentId}/subinterfaces
+        """
+        print("  Fetching VLAN subinterfaces (per-parent endpoints)...")
+        subifs: List[Dict] = []
+        for base, parents in (
+            ("/devices/default/interfaces", physical_interfaces),
+            ("/devices/default/etherchannelinterfaces", etherchannel_interfaces),
+        ):
+            for parent in parents:
+                parent_id = parent.get("id", "")
+                if not parent_id:
+                    continue
+                subifs.extend(self._fetch_all(f"{base}/{parent_id}/subinterfaces"))
+        print(f"    → {len(subifs)} subinterfaces")
+        return subifs
 
     def read_security_zones(self) -> List[Dict]:
         print("  Fetching security zones (/object/securityzones)...")
@@ -155,11 +196,13 @@ class FTDReader(FTDBaseClient):
 
     def read_all(self) -> Dict[str, Any]:
         """Pull the complete FTD configuration and return a normalized dict."""
-        return {
+        config: Dict[str, Any] = {
             "network_objects":         self.read_network_objects(),
             "network_groups":          self.read_network_groups(),
             "tcp_ports":               self.read_tcp_ports(),
             "udp_ports":               self.read_udp_ports(),
+            "icmpv4_ports":            self.read_icmpv4_ports(),
+            "icmpv6_ports":            self.read_icmpv6_ports(),
             "port_groups":             self.read_port_groups(),
             "interfaces":              self.read_interfaces(),
             "etherchannel_interfaces": self.read_etherchannel_interfaces(),
@@ -167,3 +210,9 @@ class FTDReader(FTDBaseClient):
             "static_routes":           self.read_static_routes(),
             "access_rules":            self.read_access_rules(),
         }
+        # VLAN subinterfaces live under per-parent endpoints; fold them into
+        # the interfaces list so the converter's vlanId branch handles them.
+        config["interfaces"] = config["interfaces"] + self.read_subinterfaces(
+            config["interfaces"], config["etherchannel_interfaces"]
+        )
+        return config

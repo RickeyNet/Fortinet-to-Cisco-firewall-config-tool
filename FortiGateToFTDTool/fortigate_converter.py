@@ -66,7 +66,7 @@ import json
 import argparse
 import sys
 
-from typing import Dict, List, Optional, Tuple, cast
+from typing import List, Optional
 
 # Import our custom converter modules
 # These modules contain the logic for converting specific object types
@@ -421,6 +421,11 @@ Supported FTD Models:
                         "(e.g. 'lan1=Ethernet1/7'). The interface's IP/MTU move onto the "
                         "BVI. Repeat the flag for multiple interfaces.")
 
+    # OPTIONAL flag: verbose debug output (route converter, etc.)
+    parser.add_argument('--debug',
+                       action='store_true',
+                       help='Enable verbose debug output during conversion')
+
     # OPTIONAL: List supported models and exit
     parser.add_argument('--list-models',
                        action='store_true',
@@ -458,33 +463,14 @@ Supported FTD Models:
 
         # Parse the cleaned YAML content into a Python dictionary
         # yaml.safe_load() safely parses YAML without executing code
+        # (safe_load returns None for an empty file - fail with a clear error)
         fg_config = yaml.safe_load(cleaned_yaml)
+        if not isinstance(fg_config, dict):
+            print(f"\n[ERROR] '{args.input_file}' contains no usable FortiGate "
+                  f"configuration (empty or non-mapping YAML)")
+            return 1
 
         print("[OK] YAML file loaded and cleaned successfully")
-
-        # ================================================================
-        # Remove problematic sections that cause parsing errors
-        # ================================================================
-        # Some FortiGate sections contain special characters or formats
-        # that aren't needed for FTD conversion and can cause issues
-
-        sections_to_remove = [
-            'system_automation-trigger',  # Contains escape characters in strings
-            'dlp_filepattern',            # Contains wildcard patterns like *.bat
-            'system_automation-action',   # May contain similar issues
-            'dlp_sensor',                 # DLP policies not needed for basic conversion
-            'dlp_settings'                # DLP settings not needed
-        ]
-
-        removed_count = 0
-        for section in sections_to_remove:
-            if section in fg_config:
-                del fg_config[section]
-                removed_count += 1
-                print(f"  Skipped section: {section} (not needed for conversion)")
-
-        if removed_count > 0:
-            print(f"[OK] Removed {removed_count} non-essential sections")
 
     except FileNotFoundError:
         # This error occurs if the file doesn't exist at the specified path
@@ -516,8 +502,9 @@ Supported FTD Models:
     print("\nInitializing converters...")
 
     # Create converter instances for address-related objects
+    # (the AddressGroupConverter is created in STEP 6, after the address
+    # objects are converted, so it can consume the rename map and skip set)
     address_converter = AddressConverter(fg_config)
-    address_group_converter = AddressGroupConverter(fg_config)
 
     # Create converter instances for service-related objects
     service_converter = ServiceConverter(fg_config)
@@ -646,6 +633,15 @@ Supported FTD Models:
     print("Converting Address Groups...")
     print("-"*60)
 
+    # Create the group converter with the address rename map (X -> X_2
+    # collision renames) and the set of skipped addresses, so group members
+    # follow renames and dangling references are filtered out
+    address_group_converter = AddressGroupConverter(
+        fg_config,
+        address_name_mapping=address_converter.get_address_name_mapping(),
+        skipped_addresses=address_converter.get_skipped_addresses(),
+    )
+
     # Call the convert() method to transform FortiGate address groups to FTD format
     # This returns a list of FTD network group dictionaries
     network_groups = address_group_converter.convert()
@@ -673,6 +669,8 @@ Supported FTD Models:
     print(f"[OK] Converted {service_stats['total_objects']} port objects")
     print(f"  - TCP objects: {service_stats['tcp_objects']}")
     print(f"  - UDP objects: {service_stats['udp_objects']}")
+    if service_stats.get('icmp_objects', 0) > 0:
+        print(f"  - ICMPv4 objects (ping echo): {service_stats['icmp_objects']}")
     print(f"  - Services split into TCP+UDP: {service_stats['split_services']}")
     if service_stats.get('multi_port_services', 0) > 0:
         print(f"  - Services split due to multiple ports: {service_stats['multi_port_services']}")
@@ -743,17 +741,21 @@ Supported FTD Models:
     print("Converting Firewall Policies...")
     print("-"*60)
 
+    # Merge the address-object and address-group rename maps so policy
+    # references follow collision renames (X -> X_2) for both kinds
+    address_ref_mapping = dict(address_converter.get_address_name_mapping())
+    address_ref_mapping.update(address_group_converter.get_group_name_mapping())
+
     # Update the policy converter with service, address, and interface mappings
     policy_converter.set_split_services(
         split_services=split_services,
-        # The mapping's values are lists of (FTD name, type) tuples at runtime;
-        # get_service_name_mapping()'s declared return type is too narrow.
-        service_name_mapping=cast(
-            Dict[str, List[Tuple[str, str]]], service_name_mapping
-        ),
+        service_name_mapping=service_name_mapping,
         skipped_services=skipped_services,
+        address_name_mapping=address_ref_mapping,
+        skipped_addresses=address_converter.get_skipped_addresses(),
         address_groups=address_groups,
         service_groups=service_groups,
+        service_group_name_mapping=service_group_converter.get_group_name_mapping(),
         interface_name_mapping=interface_name_mapping
     )
 
@@ -765,6 +767,11 @@ Supported FTD Models:
     print(f"[OK] Converted {policy_stats['total_rules']} access rules")
     print(f"  - PERMIT rules: {policy_stats['permit_rules']}")
     print(f"  - DENY rules: {policy_stats['deny_rules']}")
+    if policy_stats.get('disabled_rules', 0) > 0:
+        print(f"  - Skipped (disabled in source config): {policy_stats['disabled_rules']}")
+    if policy_stats.get('fail_closed_skipped', 0) > 0:
+        print(f"  - Skipped (all src/dst/services filtered - fail closed): "
+              f"{policy_stats['fail_closed_skipped']}")
 
     # ========================================================================
     # STEP 11: Convert static routes
@@ -874,8 +881,12 @@ Supported FTD Models:
             conversion_failures["interfaces"] = interface_converter.failed_items
         if address_converter.failed_items:
             conversion_failures["address_objects"] = address_converter.failed_items
+        if address_group_converter.failed_items:
+            conversion_failures["address_groups"] = address_group_converter.failed_items
         if service_converter.failed_items:
             conversion_failures["service_objects"] = service_converter.failed_items
+        if service_group_converter.failed_items:
+            conversion_failures["service_groups"] = service_group_converter.failed_items
         if route_converter.failed_items:
             conversion_failures["static_routes"] = route_converter.failed_items
         if policy_converter.failed_items:
@@ -905,7 +916,9 @@ Supported FTD Models:
                 "access_rules": {
                     "total": policy_stats['total_rules'],
                     "permit": policy_stats['permit_rules'],
-                    "deny": policy_stats['deny_rules']
+                    "deny": policy_stats['deny_rules'],
+                    "disabled_skipped": policy_stats.get('disabled_rules', 0),
+                    "fail_closed_skipped": policy_stats.get('fail_closed_skipped', 0)
                 },
                 "static_routes": {
                     "total": route_stats['total_routes'],

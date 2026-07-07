@@ -61,7 +61,7 @@ IMPORTANT NOTES:
 
 from typing import Dict, List, Any, Optional, Set, Tuple
 
-from common import sanitize_name
+from common import sanitize_name, first_item
 
 
 class PolicyConverter:
@@ -81,14 +81,16 @@ class PolicyConverter:
                  split_services: Optional[Set[str]] = None,
                  service_name_mapping: Optional[Dict[str, List[Tuple[str, str]]]] = None,
                  skipped_services: Optional[Set[str]] = None,
-                 address_name_mapping: Optional[Dict[str, List[str]]] = None,
+                 address_name_mapping: Optional[Dict[str, str]] = None,
                  address_group_members: Optional[Dict[str, List[str]]] = None,
                  address_groups: Optional[Set[str]] = None,
                  service_groups: Optional[Set[str]] = None,
-                 interface_name_mapping: Optional[Dict[str, str]] = None) -> None:
+                 interface_name_mapping: Optional[Dict[str, str]] = None,
+                 skipped_addresses: Optional[Set[str]] = None,
+                 service_group_name_mapping: Optional[Dict[str, str]] = None) -> None:
         """
         Initialize the converter with FortiGate configuration data.
-        
+
         Args:
             fortigate_config: Dictionary containing the complete parsed FortiGate YAML
                              Expected to have a 'firewall_policy' key
@@ -96,11 +98,16 @@ class PolicyConverter:
             service_name_mapping: Dict mapping FortiGate service names to list of (FTD name, type) tuples
                                  Example: {"DNS": [("DNS_TCP", "tcpportobject"), ("DNS_UDP", "udpportobject")]}
             skipped_services: Set of service names that were skipped (ICMP, etc.)
-            address_name_mapping: Dict mapping FortiGate address names to sanitized FTD names
+            address_name_mapping: Dict mapping FortiGate address/group names to final FTD names
+                                 (includes collision renames like X -> X_2). When provided,
+                                 references without a converted object are dropped.
             address_group_members: Dict mapping group names to their flattened member lists
             address_groups: Set of address group names (to set correct type in rules)
             service_groups: Set of service group names (to set correct type in rules)
             interface_name_mapping: Dict mapping FortiGate interface names to FTD names
+            skipped_addresses: Set of sanitized address names that were not converted
+            service_group_name_mapping: Dict mapping original sanitized service group
+                                 names to final FTD group names (collision renames)
         """
         # Store the entire FortiGate configuration
         self.fg_config = fortigate_config
@@ -128,13 +135,21 @@ class PolicyConverter:
 
         # Interface name mapping for zones
         self.interface_name_mapping = interface_name_mapping or {}
-        
+
+        # Sanitized names of addresses that were not converted
+        self.skipped_addresses = skipped_addresses or set()
+
+        # Mapping of original sanitized service group name -> final FTD name
+        self.service_group_name_mapping = service_group_name_mapping or {}
+
         # This will store the converted FTD access rules
         self.ftd_access_rules = []
 
         # Track statistics
         self.permit_count = 0
         self.deny_count = 0
+        self.disabled_count = 0  # policies disabled in the source config
+        self.fail_closed_count = 0  # rules skipped because a match list emptied out
 
         # Track items that failed/were skipped during conversion
         self.failed_items = []
@@ -184,13 +199,29 @@ class PolicyConverter:
             # ================================================================
             # Each policy looks like: {161: {name: ..., action: ...}}
             # The policy ID is the key (e.g., 161)
-            policy_id = list(policy_dict.keys())[0]
-            properties = policy_dict[policy_id]
-            
+            item = first_item(policy_dict)
+            if item is None:
+                print("  Skipped: empty/malformed policy entry")
+                continue
+            policy_id, properties = item
+
             # ================================================================
             # STEP 2B: Extract basic policy information
             # ================================================================
             policy_name_raw = properties.get('name', f'Policy_{policy_id}')
+
+            # Disabled policies are NOT converted (FDM access rules have no
+            # disabled flag, so importing them would activate dead rules).
+            if str(properties.get('status', 'enable')).strip().lower() == 'disable':
+                print(f"  Skipped: [{policy_id}] {policy_name_raw} (disabled in source config)")
+                self.disabled_count += 1
+                self.failed_items.append({
+                    "name": str(policy_name_raw),
+                    "reason": "disabled in source config",
+                    "config": properties,
+                })
+                continue
+
             policy_name = sanitize_name(policy_name_raw)
 
             # Deduplicate: if this name was already used, append _2, _3, etc.
@@ -201,18 +232,12 @@ class PolicyConverter:
                 used_names[policy_name] = 1
 
             action = properties.get('action', 'deny')
-            
+
             # ================================================================
             # STEP 2C: Map FortiGate action to FTD action
             # ================================================================
             ftd_action = self._map_action(action)
-            
-            # Track statistics
-            if ftd_action == 'PERMIT':
-                self.permit_count += 1
-            else:
-                self.deny_count += 1
-            
+
             # ================================================================
             # STEP 2D: Extract and normalize source/destination interfaces
             # ================================================================
@@ -244,7 +269,38 @@ class PolicyConverter:
             
             # Convert to FTD port object format
             ftd_dest_ports = self._create_port_objects(expanded_services)
-            
+
+            # ================================================================
+            # STEP 2F2: Fail closed - never emit a rule broader than the source
+            # ================================================================
+            # An empty match list in FTD means "any". If the source rule
+            # restricted src/dst/service but every entry was filtered out or
+            # unresolvable, converting it would broaden the rule - skip it.
+            fail_closed_reason = None
+            if self._has_specific_entries(source_addrs) and not ftd_source_networks:
+                fail_closed_reason = "all source addresses were skipped/unresolvable"
+            elif self._has_specific_entries(dest_addrs) and not ftd_dest_networks:
+                fail_closed_reason = "all destination addresses were skipped/unresolvable"
+            elif self._has_specific_entries(services) and not ftd_dest_ports:
+                fail_closed_reason = "all services were skipped/unresolvable"
+
+            if fail_closed_reason:
+                print(f"  Skipped: [{policy_id}] {policy_name} ({fail_closed_reason} - "
+                      f"rule would be broader than source)")
+                self.fail_closed_count += 1
+                self.failed_items.append({
+                    "name": policy_name,
+                    "reason": fail_closed_reason,
+                    "config": properties,
+                })
+                continue
+
+            # Track statistics (only for rules that are actually emitted)
+            if ftd_action == 'PERMIT':
+                self.permit_count += 1
+            else:
+                self.deny_count += 1
+
             # ================================================================
             # STEP 2G: Create the FTD access rule structure
             # ================================================================
@@ -308,6 +364,11 @@ class PolicyConverter:
             print(f"    Warning: Unknown action '{fg_action}', defaulting to DENY")
             return 'DENY'
     
+    @staticmethod
+    def _has_specific_entries(names: List[Any]) -> bool:
+        """True if *names* restricts matching (has entries besides all/any)."""
+        return any(str(n).lower() not in ('all', 'any') for n in names)
+
     def _normalize_to_list(self, value: Any) -> List[str]:
         """
         Normalize a value to always be a list.
@@ -400,13 +461,20 @@ class PolicyConverter:
             return self.interface_name_mapping[zone_name_lower]
         
         # Strategy 3: Check if any mapping value contains this as a suffix
-        # Handles cases like "551" matching "l_slap_551"
-        for fg_name, ftd_name in self.interface_name_mapping.items():
-            if zone_name.isdigit() and ftd_name.endswith(f"_{zone_name}"):
-                return ftd_name
-            if ftd_name.endswith(f"_{zone_name_lower}"):
-                return ftd_name
-        
+        # Handles cases like "551" matching "l_slap_551". Collect ALL
+        # candidates and pick deterministically (sorted) so the result does
+        # not depend on dict iteration order; warn when ambiguous.
+        candidates = sorted({
+            ftd_name for ftd_name in self.interface_name_mapping.values()
+            if (zone_name.isdigit() and ftd_name.endswith(f"_{zone_name}"))
+            or ftd_name.endswith(f"_{zone_name_lower}")
+        })
+        if candidates:
+            if len(candidates) > 1:
+                print(f"    [WARNING] Interface '{zone_name}' matches multiple zones "
+                      f"({', '.join(candidates)}) - using '{candidates[0]}', verify")
+            return candidates[0]
+
         # Strategy 4: Sanitize using existing function and try lookup
         sanitized = sanitize_name(zone_name).lower()
         if sanitized in self.interface_name_mapping:
@@ -433,43 +501,55 @@ class PolicyConverter:
             List of FTD network object reference dictionaries
         """
         network_objects = []
-        
+        seen_refs = set()  # dedupe: two source names can map to one object
+
+        def _append_ref(name: str, obj_type: str) -> None:
+            if (name, obj_type) not in seen_refs:
+                seen_refs.add((name, obj_type))
+                network_objects.append({"name": name, "type": obj_type})
+
         for addr_name in addr_names:
+            addr_str = str(addr_name)
             # Skip 'all' and 'any' as they mean no address restriction
-            if addr_name.lower() in ['all', 'any']:
+            if addr_str.lower() in ['all', 'any']:
                 continue
-            
+
             # Sanitize the address name
-            sanitized_name = sanitize_name(addr_name)
-            
+            sanitized_name = sanitize_name(addr_str)
+
+            # Filter out addresses the AddressConverter did not migrate
+            # (factory defaults, invalid objects) - a verbatim reference
+            # would be dangling on FDM import.
+            if sanitized_name in self.skipped_addresses:
+                print(f"    Filtered out address: {addr_str} (address not migrated)")
+                continue
+
             # Check if this is a flattened group - if so, expand to individual members
             if sanitized_name in self.address_group_members:
                 # This was a group that got flattened - add all individual members
                 for member_name in self.address_group_members[sanitized_name]:
-                    network_obj = {
-                        "name": member_name,
-                        "type": "networkobject"
-                    }
-                    network_objects.append(network_obj)
+                    _append_ref(member_name, "networkobject")
             else:
-                # Check if we have a mapping for this name
+                # Follow collision renames (X -> X_2) for objects AND groups;
+                # the merged mapping is supplied by the main script.
                 if sanitized_name in self.address_name_mapping:
                     ftd_name = self.address_name_mapping[sanitized_name]
                 else:
                     ftd_name = sanitized_name
-                
+                    # Fail closed: when a mapping was supplied, drop references
+                    # that have no converted object behind them.
+                    if self.address_name_mapping and sanitized_name not in self.address_groups:
+                        print(f"    Filtered out address: {addr_str} (no converted object)")
+                        continue
+
                 # Determine type - is this a group or individual object?
-                if sanitized_name in self.address_groups:
+                if ftd_name in self.address_groups or sanitized_name in self.address_groups:
                     obj_type = "networkobjectgroup"
                 else:
                     obj_type = "networkobject"
-                
-                network_obj = {
-                    "name": ftd_name,
-                    "type": obj_type
-                }
-                network_objects.append(network_obj)
-        
+
+                _append_ref(ftd_name, obj_type)
+
         return network_objects
     
     def _expand_services(self, services: List[str]) -> List[Tuple[str, str]]:
@@ -486,32 +566,31 @@ class PolicyConverter:
             List of (name, type) tuples for FTD port objects
         """
         expanded = []
-        
+
         for service in services:
+            service_str = str(service)
             # Skip 'ALL' and 'any' as they mean no service restriction
-            if service.upper() in ['ALL', 'ANY']:
+            if service_str.upper() in ['ALL', 'ANY']:
                 continue
-            
+
             # Sanitize the service name
-            sanitized_name = sanitize_name(service)
-            
+            sanitized_name = sanitize_name(service_str)
+
             # Skip if this service was skipped (ICMP, etc.)
             if sanitized_name in self.skipped_services:
-                print(f"    Filtered out service: {service} (ICMP/non-port service)")
+                print(f"    Filtered out service: {service_str} (ICMP/non-port service)")
                 continue
-            
-            # Check if this is a service GROUP
-            if sanitized_name in self.service_groups:
+
+            # Check if this is a service GROUP (following collision renames)
+            if sanitized_name in self.service_group_name_mapping:
+                expanded.append((self.service_group_name_mapping[sanitized_name], "portobjectgroup"))
+            elif sanitized_name in self.service_groups:
                 expanded.append((sanitized_name, "portobjectgroup"))
             # Check if this service is in our mapping (individual service)
             elif sanitized_name in self.service_name_mapping:
                 # Get all FTD objects for this service (list of (name, type) tuples)
                 ftd_objects = self.service_name_mapping[sanitized_name]
                 expanded.extend(ftd_objects)
-            elif service in self.split_services:
-                # DEPRECATED: Old way - just add _TCP and _UDP suffixes
-                expanded.append((f"{sanitized_name}_TCP", "tcpportobject"))
-                expanded.append((f"{sanitized_name}_UDP", "udpportobject"))
             else:
                 # Service not in mapping - use sanitized name, guess type from name
                 if '_UDP' in sanitized_name:
@@ -532,14 +611,17 @@ class PolicyConverter:
             List of FTD port object reference dictionaries
         """
         port_objects = []
-        
+        seen_refs = set()  # dedupe: two service names can map to one object
+
         for name, obj_type in service_info:
-            port_obj = {
+            if (name, obj_type) in seen_refs:
+                continue
+            seen_refs.add((name, obj_type))
+            port_objects.append({
                 "name": name,
                 "type": obj_type
-            }
-            port_objects.append(port_obj)
-        
+            })
+
         return port_objects
     
     def set_split_services(self, split_services: Optional[Set[str]] = None,
@@ -549,21 +631,26 @@ class PolicyConverter:
                            address_group_members: Optional[Dict[str, List[str]]] = None,
                            address_groups: Optional[Set[str]] = None,
                            service_groups: Optional[Set[str]] = None,
-                           interface_name_mapping: Optional[Dict[str, str]] = None) -> None:
+                           interface_name_mapping: Optional[Dict[str, str]] = None,
+                           skipped_addresses: Optional[Set[str]] = None,
+                           service_group_name_mapping: Optional[Dict[str, str]] = None) -> None:
         """
         Update the service and address mappings.
-        
+
         This should be called by the main script after converting service and address objects,
         so the policy converter knows how to expand references.
-        
+
         Args:
             split_services: (DEPRECATED) Set of service names that have both TCP and UDP versions
             service_name_mapping: Dict mapping FortiGate service names to list of (FTD name, type) tuples
             skipped_services: Set of service names that were skipped (ICMP, etc.)
-            address_name_mapping: Dict mapping FortiGate address names to sanitized FTD names
+            address_name_mapping: Dict mapping FortiGate address/group names to final FTD names
             address_group_members: Dict mapping group names to their flattened member lists
             address_groups: Set of address group names (to set correct type in rules)
             service_groups: Set of service group names (to set correct type in rules)
+            skipped_addresses: Set of sanitized address names that were not converted
+            service_group_name_mapping: Dict mapping original sanitized service group
+                                 names to final FTD group names (collision renames)
         """
         if split_services is not None:
             self.split_services = split_services
@@ -581,18 +668,24 @@ class PolicyConverter:
             self.service_groups = service_groups
         if interface_name_mapping is not None:
             self.interface_name_mapping = interface_name_mapping
-    
+        if skipped_addresses is not None:
+            self.skipped_addresses = skipped_addresses
+        if service_group_name_mapping is not None:
+            self.service_group_name_mapping = service_group_name_mapping
+
     def get_statistics(self) -> Dict[str, int]:
         """
         Get conversion statistics for reporting.
-        
+
         Returns:
             Dictionary with counts of rules and actions
         """
         return {
             "total_rules": len(self.ftd_access_rules),
             "permit_rules": self.permit_count,
-            "deny_rules": self.deny_count
+            "deny_rules": self.deny_count,
+            "disabled_rules": self.disabled_count,  # disabled in source, not converted
+            "fail_closed_skipped": self.fail_closed_count  # skipped to avoid broadening
         }
 
 

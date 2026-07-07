@@ -63,6 +63,7 @@ class _FakeImporterClient:
         }
         self._attempts: Dict[str, int] = {}
         self.failed_items: List[Dict[str, str]] = []
+        self.phase_failures: List[str] = []
 
     def record_stat(self, key: str) -> None:
         self.stats[key] += 1

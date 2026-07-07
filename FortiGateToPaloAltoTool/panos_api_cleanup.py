@@ -19,6 +19,8 @@ DELETION ORDER (reverse of import):
     5. Address objects
     6. Static routes
     7. Zones
+    8. VLAN interfaces (vlan.N SVIs) and VLAN objects
+    9. Aggregate-ethernet interfaces and ethernet resets (incl. layer2)
 
 HOW TO RUN:
     python panos_api_cleanup.py --host 10.0.0.1 --username admin --delete-all
@@ -111,67 +113,46 @@ class PANOSBulkDelete(PANOSBaseClient):
         return failed == 0, deleted
 
     def _get_object_names(self, xpath: str) -> List[str]:
-        """Retrieve all entry names at the given XPath."""
-        ok, response = self.config_get(xpath)
+        """Retrieve the top-level entry names at the given XPath.
+
+        Only direct entries of the queried container are returned - nested
+        <entry> elements (e.g. IP entries under an ethernet interface's
+        <layer3><ip>) must not be mistaken for objects.
+        """
+        ok, response = self.config_get_xml(xpath)
         if not ok:
             if self.debug:
-                print(f"  [DEBUG] config_get failed: {response}")
+                print(f"  [DEBUG] config_get_xml failed: {response}")
             return []
 
         try:
-            # The response might be the full XML or just the result portion
-            # Try to parse as XML to extract entry names
-            root = ET.fromstring(f"<root>{response}</root>")
-            names = []
-            for entry in root.iter("entry"):
-                name = entry.attrib.get("name")
-                if name:
-                    names.append(name)
-            return names
-        except ET.ParseError:
-            pass
-
-        # Alternative: try parsing the full API response
-        try:
-            ok2, raw = self._config_request("get", xpath)
-            if not ok2:
-                return []
-            # The base method returns the message, but we need the raw response
-            # Fall back to direct API call
-            return self._get_names_direct(xpath)
-        except Exception:
+            root = ET.fromstring(response)
+        except ET.ParseError as e:
+            if self.debug:
+                print(f"  [DEBUG] could not parse config response: {e}")
             return []
 
-    def _get_names_direct(self, xpath: str) -> List[str]:
-        """Direct API call to get entry names at xpath."""
-        if not self.api_key:
+        result = root.find(".//result")
+        if result is None:
             return []
 
-        try:
-            resp = self.session.get(
-                self.base_url,
-                params={
-                    "type": "config",
-                    "action": "get",
-                    "xpath": xpath,
-                    "key": self.api_key,
-                },
-                timeout=30,
-            )
+        # PAN-OS usually wraps the entries in a container element named after
+        # the last XPath node (<result><address><entry .../></address></result>)
+        # but some versions/paths return the entries directly under <result>.
+        entries = result.findall("entry")
+        if not entries:
+            entries = [
+                entry
+                for container in result
+                for entry in container.findall("entry")
+            ]
 
-            if resp.status_code != 200:
-                return []
-
-            root = ET.fromstring(resp.text)
-            names = []
-            for entry in root.iter("entry"):
-                name = entry.attrib.get("name")
-                if name:
-                    names.append(name)
-            return names
-
-        except Exception:
-            return []
+        names = []
+        for entry in entries:
+            name = entry.attrib.get("name")
+            if name:
+                names.append(name)
+        return names
 
     def delete_all(self, commit: bool = False) -> bool:
         """Delete all custom objects in reverse dependency order.
@@ -181,7 +162,8 @@ class PANOSBulkDelete(PANOSBaseClient):
         """
         all_ok = True
 
-        # Delete in reverse import order (dependents first)
+        # Delete in reverse import order (dependents first). vlan.N SVIs and
+        # vlan objects must go before the interface resets that reference them.
         delete_order = [
             "security_rule",
             "service_group",
@@ -190,19 +172,22 @@ class PANOSBulkDelete(PANOSBaseClient):
             "address",
             "static_route",
             "zone",
+            "vlan_interface",
+            "vlan",
             "aggregate_ethernet",
         ]
-
-        # Reset physical ethernet interfaces (can't delete, only clear config)
-        print(f"\n{'=' * 60}")
-        print("Resetting ethernet interface configs...")
-        print(f"{'=' * 60}")
-        self._reset_ethernet_interfaces()
 
         for obj_type in delete_order:
             ok, _ = self.delete_objects_by_type(obj_type)
             if not ok:
                 all_ok = False
+
+        # Reset physical ethernet interfaces (can't delete, only clear config)
+        print(f"\n{'=' * 60}")
+        print("Resetting ethernet interface configs...")
+        print(f"{'=' * 60}")
+        if not self._reset_ethernet_interfaces():
+            all_ok = False
 
         if commit and not self.dry_run:
             success, msg = self.commit()
@@ -212,45 +197,61 @@ class PANOSBulkDelete(PANOSBaseClient):
 
         return all_ok
 
-    def _reset_ethernet_interfaces(self) -> None:
-        """Reset ethernet interfaces by removing layer3 config and comments.
+    # Subtrees removed from each ethernet entry when resetting it. layer2 is
+    # included so converted switch member ports are cleaned up too.
+    _ETHERNET_RESET_NODES = ("layer3", "layer2", "comment", "aggregate-group")
+
+    # Error fragments meaning "nothing to delete" - not a real failure when
+    # clearing config nodes that may simply not exist on an interface.
+    _BENIGN_DELETE_ERRORS = ("no object", "not present", "does not exist")
+
+    def _reset_ethernet_interfaces(self) -> bool:
+        """Reset ethernet interfaces by removing layer3/layer2 config and comments.
 
         Physical ethernet interfaces can't be deleted on PAN-OS - they're
-        hardware entries. Instead we remove the layer3 config (IP, MTU, etc.)
-        and any comments/aggregate-group assignments.
+        hardware entries. Instead we remove the layer3/layer2 config (IP, MTU,
+        etc.) and any comments/aggregate-group assignments.
+
+        Returns:
+            True if every interface was reset successfully.
         """
         xpath = XPATHS.get("ethernet", "")
         if not xpath:
-            return
+            return True
 
         names = self._get_object_names(xpath)
         if not names:
             print("  No ethernet interfaces with config found.")
-            return
+            return True
 
         reset_count = 0
+        fail_count = 0
         for name in names:
-            # Delete the layer3 subtree
-            layer3_xpath = f"{xpath}/entry[@name='{name}']/layer3"
-            comment_xpath = f"{xpath}/entry[@name='{name}']/comment"
-            ag_xpath = f"{xpath}/entry[@name='{name}']/aggregate-group"
-
             if self.dry_run:
                 print(f"  [DRY-RUN] Would reset: {name}")
                 reset_count += 1
                 continue
 
-            # Remove layer3 config
-            self.config_delete(layer3_xpath)
-            # Remove comment
-            self.config_delete(comment_xpath)
-            # Remove aggregate-group assignment
-            self.config_delete(ag_xpath)
-            print(f"  [OK] Reset: {name}")
-            reset_count += 1
+            errors = []
+            for node in self._ETHERNET_RESET_NODES:
+                ok, msg = self.config_delete(f"{xpath}/entry[@name='{name}']/{node}")
+                if not ok and not any(
+                    b in str(msg).lower() for b in self._BENIGN_DELETE_ERRORS
+                ):
+                    errors.append(f"{node}: {msg}")
+
+            if errors:
+                print(f"  [FAIL] Reset {name}: {'; '.join(errors)}")
+                fail_count += 1
+            else:
+                print(f"  [OK] Reset: {name}")
+                reset_count += 1
 
         self.stats["deleted"] += reset_count
-        print(f"\n  ethernet interfaces reset: {reset_count}")
+        self.stats["failed"] += fail_count
+        print(f"\n  ethernet interfaces reset: {reset_count}"
+              + (f", {fail_count} failed" if fail_count else ""))
+        return fail_count == 0
 
     def print_summary(self) -> None:
         """Print cleanup summary."""
@@ -373,9 +374,11 @@ Examples:
             ok, _ = client.delete_objects_by_type("zone")
             all_ok = all_ok and ok
         if args.delete_interfaces:
-            ok, _ = client.delete_objects_by_type("aggregate_ethernet")
-            all_ok = all_ok and ok
-            client._reset_ethernet_interfaces()
+            for obj_type in ("vlan_interface", "vlan", "aggregate_ethernet"):
+                ok, _ = client.delete_objects_by_type(obj_type)
+                all_ok = all_ok and ok
+            if not client._reset_ethernet_interfaces():
+                all_ok = False
 
         if args.commit and not args.dry_run:
             success, msg = client.commit()

@@ -18,9 +18,15 @@ Output JSON (later converted to XML by the importer):
     }
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
-from pa_common import sanitize_name, netmask_to_cidr, is_default_fortigate_address
+from pa_common import (
+    sanitize_name,
+    netmask_to_cidr,
+    is_default_fortigate_address,
+    first_item,
+    dedup_name,
+)
 
 
 class PAAddressConverter:
@@ -30,6 +36,13 @@ class PAAddressConverter:
         self.fg_config = fortigate_config
         self.pa_address_objects: List[Dict] = []
         self.failed_items: List[Dict] = []
+
+        # FortiGate name (raw and sanitized) -> final PAN-OS name. Consumed by
+        # the address-group and policy converters so dedup renames propagate.
+        self._name_map: Dict[str, str] = {}
+        # Names (raw and sanitized) of addresses that were skipped or are
+        # FortiGate defaults - group members / policy refs to these are filtered.
+        self._skipped_addresses: Set[str] = set()
 
     def convert(self) -> List[Dict]:
         """Convert all FortiGate address objects to PAN-OS format.
@@ -46,24 +59,17 @@ class PAAddressConverter:
         used_names: Dict[str, int] = {}
 
         for addr_dict in addresses:
-            object_name = list(addr_dict.keys())[0]
-            properties = addr_dict[object_name]
+            item = first_item(addr_dict)
+            if item is None:
+                continue
+            object_name, properties = item
 
             # Silently ignore FortiGate factory-default objects. These exist on
             # every appliance and are not meaningful to migrate, so they are not
             # reported as skipped/failed items.
             if is_default_fortigate_address(object_name):
                 print(f"  Ignored: {object_name} (FortiGate default object)")
-                continue
-
-            # Skip objects named "none"
-            if object_name.lower() == "none":
-                print(f"  Skipped: {object_name} (name is 'none')")
-                self.failed_items.append({
-                    "name": object_name,
-                    "reason": "name is 'none'",
-                    "config": properties,
-                })
+                self._mark_skipped(object_name)
                 continue
 
             # Determine PAN-OS type and value
@@ -77,6 +83,7 @@ class PAAddressConverter:
                     "reason": "empty value",
                     "config": properties,
                 })
+                self._mark_skipped(object_name)
                 continue
 
             # Validate non-FQDN values
@@ -87,15 +94,13 @@ class PAAddressConverter:
                     "reason": f"invalid value: {pa_value}",
                     "config": properties,
                 })
+                self._mark_skipped(object_name)
                 continue
 
             # Sanitize and deduplicate name
-            sanitized = sanitize_name(object_name)
-            if sanitized in used_names:
-                used_names[sanitized] += 1
-                sanitized = f"{sanitized}_{used_names[sanitized]}"
-            else:
-                used_names[sanitized] = 1
+            sanitized = dedup_name(sanitize_name(object_name), used_names)
+            self._name_map[object_name] = sanitized
+            self._name_map.setdefault(sanitize_name(object_name), sanitized)
 
             pa_object = {
                 "name": sanitized,
@@ -112,6 +117,22 @@ class PAAddressConverter:
 
         self.pa_address_objects = results
         return results
+
+    # ------------------------------------------------------------------
+    # Public accessors (consumed by group and policy converters)
+    # ------------------------------------------------------------------
+
+    def get_name_map(self) -> Dict[str, str]:
+        """FortiGate name (raw and sanitized) -> final PAN-OS object name."""
+        return dict(self._name_map)
+
+    def get_skipped_addresses(self) -> Set[str]:
+        """Names (raw and sanitized) of addresses that were not converted."""
+        return set(self._skipped_addresses)
+
+    def _mark_skipped(self, object_name: str) -> None:
+        self._skipped_addresses.add(str(object_name))
+        self._skipped_addresses.add(sanitize_name(object_name))
 
     # ------------------------------------------------------------------
     # Helpers
@@ -150,12 +171,21 @@ class PAAddressConverter:
             return ""
 
         if pa_type == "fqdn":
+            # Only the fqdn field is a valid value. Never fall back to the
+            # comment - it is free text, not a hostname. Missing fqdn -> ""
+            # so the caller skips the object with a failed_items entry.
             fqdn = properties.get("fqdn", "")
-            if not fqdn:
-                fqdn = properties.get("comment", "")
             return str(fqdn).strip().strip('"').strip("'")
 
         # ip-netmask type
+        # Single-host iprange (start-ip == end-ip): _determine_type maps it to
+        # ip-netmask, so build the value from start-ip as a /32 host.
+        if properties.get("type") == "iprange":
+            start_ip = str(properties.get("start-ip", "")).strip()
+            if start_ip:
+                return f"{start_ip}/32"
+            return ""
+
         if "subnet" in properties:
             subnet = properties["subnet"]
             if isinstance(subnet, list) and len(subnet) >= 2:
