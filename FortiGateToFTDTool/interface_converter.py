@@ -29,7 +29,12 @@ FTD INTERFACE NAME RULES:
 import re
 from typing import Dict, List, Any, Set, Optional
 
-from common import collect_mgmt_ha_interfaces, first_item, netmask_to_cidr
+from common import (
+    collect_mgmt_ha_interfaces,
+    first_item,
+    is_default_fortigate_interface,
+    netmask_to_cidr,
+)
 
 
 # =============================================================================
@@ -1300,6 +1305,14 @@ class InterfaceConverter:
                 print(f"    Ignored: {intf_name} (dedicated management/HA interface)")
                 continue
 
+            # Silently ignore FortiGate factory-default virtual interfaces
+            # (ssl.<vdom>, l2t.<vdom>, naf.<vdom>, modem). They exist on
+            # every appliance and are not meaningful to migrate, so they are
+            # not reported as skipped/failed items.
+            if is_default_fortigate_interface(intf_name):
+                print(f"    Ignored: {intf_name} (FortiGate default virtual interface)")
+                continue
+
             intf_type = properties.get('type', 'physical')
 
             # Check if this is a VLAN interface (has 'interface' and 'vlanid')
@@ -1708,11 +1721,10 @@ class InterfaceConverter:
     def _convert_physical_interface(self, fg_name: str, properties: Dict) -> None:
         """Convert a FortiGate physical interface to FTD format."""
         
-        # Skip certain interfaces
-        if fg_name in ['ha', 'mgmt', 'modem', 'naf.root', 'l2t.root', 'ssl.root']:
-            print(f"    Skipped: {fg_name} (system/virtual interface)")
-            self.stats['skipped'] += 1
-            self.failed_items.append({"name": fg_name, "reason": "system/virtual interface", "config": properties})
+        # Defense in depth: factory/system interfaces are filtered out during
+        # categorization; silently ignore if one slips through another path.
+        if fg_name in ('ha', 'mgmt') or is_default_fortigate_interface(fg_name):
+            print(f"    Ignored: {fg_name} (system/virtual interface)")
             return
         
         # Skip interfaces that start with s, vw (special FortiGate ports)

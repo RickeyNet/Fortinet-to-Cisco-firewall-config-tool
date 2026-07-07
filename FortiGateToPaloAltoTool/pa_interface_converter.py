@@ -55,7 +55,12 @@ PA-440 hardware reference:
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from pa_common import sanitize_name, netmask_to_cidr, collect_mgmt_ha_interfaces
+from pa_common import (
+    sanitize_name,
+    netmask_to_cidr,
+    collect_mgmt_ha_interfaces,
+    is_default_fortigate_interface,
+)
 
 
 # PA model definitions
@@ -268,10 +273,12 @@ class PAInterfaceConverter:
                 self._stats["skipped"] += 1
                 continue
 
-            # Skip system/virtual interfaces
-            if intf_name in self._SKIP_NAMES:
-                print(f"    Skipped: {intf_name} (system/virtual interface)")
-                self._stats["skipped"] += 1
+            # Silently ignore FortiGate factory-default virtual interfaces
+            # (ssl.<vdom>, l2t.<vdom>, naf.<vdom>, modem) and other built-in
+            # system interfaces - they exist on every appliance and are not
+            # meaningful to migrate.
+            if intf_name in self._SKIP_NAMES or is_default_fortigate_interface(intf_name):
+                print(f"    Ignored: {intf_name} (FortiGate system/virtual interface)")
                 continue
 
             # Silently ignore dedicated management and HA interfaces. These

@@ -22,6 +22,7 @@ import glob
 import io
 import json
 import queue
+import random
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -503,6 +504,21 @@ THEMES = {
         "out_bg":   "#070d24",
         "out_fg":   "#7dd3a0",
     },
+    "Simulation": {
+        "bg":       "#000000",
+        "input":    "#0a140a",
+        "fg":       "#00e63c",
+        "fg_dim":   "#0f7a2a",
+        "accent":   "#00ff41",
+        "accent_d": "#0d1f0d",
+        "accent_h": "#7dff9f",
+        "border":   "#123d1c",
+        "btn_bg":   "#00ff41",
+        "btn_fg":   "#000000",
+        "tab_bg":   "#0a140a",
+        "out_bg":   "#000000",
+        "out_fg":   "#00ff41",
+    },
     "Light": {
         "bg":       "#f0f0eb",
         "input":    "#ffffff",
@@ -539,6 +555,139 @@ _OUT_BG   = _t["out_bg"]
 _OUT_FG   = _t["out_fg"]
 
 APP_VERSION = "1.6.0"
+
+
+# ---------------------------------------------------------------------------
+# Matrix "digital rain" overlay (Simulation theme)
+# ---------------------------------------------------------------------------
+class _MatrixRain:
+    """Animated Matrix-style digital rain drawn over an idle output console.
+
+    A borderless Canvas is placed exactly over the host Text widget and
+    animates falling glyph columns. The overlay is purely decorative: it is
+    shown only while the console is empty and no operation is running (see
+    App._update_matrix_rain), so it can never cover real output. Drawing
+    pauses while the canvas is not viewable (e.g. its tab is hidden).
+    """
+
+    _GLYPHS = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾅﾆﾇﾈﾊﾋﾎﾏﾐﾑﾒﾓﾔﾕﾗﾘﾜ0123456789Z:=*+-<>"
+    # Head glyph first, then progressively darker greens down the trail.
+    _TRAIL = ("#d8ffe4", "#00ff41", "#00e63c", "#00b32d",
+              "#008f26", "#0f7a2a", "#0a3f16", "#062b10")
+    _CELL_W = 14
+    _CELL_H = 17
+    _TICK_MS = 70
+
+    def __init__(self, host: tk.Text) -> None:
+        self._host = host
+        self._canvas: Optional[tk.Canvas] = None
+        self._after_id: Optional[str] = None
+        self._columns: List[Dict[str, Any]] = []
+        self._width = 0
+        self._height = 0
+        self._tick_count = 0
+        self._active = False
+
+    def start(self) -> None:
+        if self._active:
+            return
+        if self._canvas is None:
+            # Sibling of the host placed over it - the standard Tk overlay
+            # trick; the Text widget underneath stays untouched.
+            self._canvas = tk.Canvas(
+                self._host.master, highlightthickness=0, bd=0,
+                bg="#000000", takefocus=0,
+            )
+        self._canvas.place(in_=self._host, x=0, y=0, relwidth=1.0, relheight=1.0)
+        # Canvas.lift() is aliased to tag_raise (canvas items), so raise the
+        # widget itself via Misc.tkraise to stack it above the Text.
+        tk.Misc.tkraise(self._canvas)
+        self._active = True
+        self._tick()
+
+    def stop(self) -> None:
+        self._active = False
+        if self._after_id is not None:
+            try:
+                self._host.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+        if self._canvas is not None:
+            try:
+                self._canvas.delete("all")
+                self._canvas.place_forget()
+            except tk.TclError:
+                self._canvas = None
+        self._columns = []
+        self._width = 0
+
+    def _rebuild_columns(self, width: int, height: int) -> None:
+        self._width, self._height = width, height
+        if self._canvas is not None:
+            self._canvas.delete("all")
+        rows = max(1, height // self._CELL_H)
+        self._columns = []
+        for i in range(max(1, width // self._CELL_W)):
+            self._columns.append({
+                "x": i * self._CELL_W + self._CELL_W // 2,
+                # Stagger starts above the visible area so columns trickle in
+                "row": -random.randint(0, rows * 2),
+                # 1 = advance every tick, 2 = every other tick (slow column)
+                "skip": random.choice((1, 1, 2)),
+                "phase": random.randint(0, 1),
+                "items": [],  # canvas item ids, oldest first
+            })
+        self._tick_count = 0
+
+    def _tick(self) -> None:
+        if not self._active:
+            return
+        try:
+            self._after_id = self._host.after(self._TICK_MS, self._tick)
+            canvas = self._canvas
+            if canvas is None or not canvas.winfo_viewable():
+                return
+            w, h = canvas.winfo_width(), canvas.winfo_height()
+            if w <= 1 or h <= 1:
+                return
+            if w != self._width or h != self._height:
+                self._rebuild_columns(w, h)
+            self._tick_count += 1
+            rows = h // self._CELL_H + 1
+            trail_len = len(self._TRAIL)
+            for col in self._columns:
+                if (self._tick_count + col["phase"]) % col["skip"]:
+                    continue
+                col["row"] += 1
+                row = col["row"]
+                items = col["items"]
+                if row - trail_len > rows:
+                    # Fully off-screen: respawn above the top
+                    for item in items:
+                        canvas.delete(item)
+                    del items[:]
+                    col["row"] = -random.randint(0, rows)
+                    continue
+                if 0 <= row <= rows:
+                    items.append(canvas.create_text(
+                        col["x"], row * self._CELL_H,
+                        text=random.choice(self._GLYPHS),
+                        fill=self._TRAIL[0], font=("Consolas", 11),
+                    ))
+                elif items:
+                    # Head ran past the bottom - drain the tail
+                    canvas.delete(items.pop(0))
+                # Fade the trail: newest item gets the head color
+                for age, item in enumerate(reversed(items)):
+                    canvas.itemconfigure(
+                        item, fill=self._TRAIL[min(age, trail_len - 1)])
+                while len(items) > trail_len:
+                    canvas.delete(items.pop(0))
+        except tk.TclError:
+            # Widget destroyed mid-animation (window closing)
+            self._active = False
+            self._after_id = None
 
 
 class App(tk.Tk):
@@ -605,8 +754,13 @@ class App(tk.Tk):
         self._current_theme = DEFAULT_THEME
         self._tk_widgets = []  # raw tk widgets that need manual recolor
 
+        # Matrix rain overlays for the output consoles (Simulation theme).
+        # Built lazily by _update_matrix_rain once the consoles exist.
+        self._rain_overlays: Dict[str, _MatrixRain] = {}
+
         self._apply_theme(THEMES[self._current_theme])
         self._build_ui()
+        self._update_matrix_rain()
 
     def _set_window_title(self, default: str) -> None:
         self.title(_profile_title(default))
@@ -850,6 +1004,31 @@ class App(tk.Tk):
             return
         self._current_theme = name
         self._apply_theme(THEMES[name])
+        self._update_matrix_rain()
+
+    def _update_matrix_rain(self) -> None:
+        """Show/hide the Matrix rain overlays (Simulation theme only).
+
+        The rain runs over an output console only while that console is empty
+        and no operation is running, so it can never cover real output. Called
+        on theme change, run start/finish, and console clear.
+        """
+        simulation = self._current_theme == "Simulation"
+        for attr in ("conv_output", "imp_output", "cln_output", "snmp_output"):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            overlay = self._rain_overlays.get(attr)
+            if overlay is None:
+                overlay = self._rain_overlays[attr] = _MatrixRain(widget)
+            try:
+                empty = not widget.get("1.0", "end-1c").strip()
+            except tk.TclError:
+                continue
+            if simulation and not self._running and empty:
+                overlay.start()
+            else:
+                overlay.stop()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -3714,6 +3893,10 @@ class App(tk.Tk):
         put("\u2022  Voyager: ", "bullet")
         put("Deep navy-blue background with gold accents. Bold and nautical.\n",
             "bullet")
+        put("\u2022  Simulation: ", "bullet")
+        put("Pure black background with phosphor-green text. Idle output "
+            "consoles show falling code, just like the Matrix. There is no "
+            "spoon.\n", "bullet")
         put("\u2022  Light: ", "bullet")
         put("Light gray background with blue accents. Bright, for well-lit "
             "rooms.\n\n", "bullet")
@@ -3948,6 +4131,7 @@ class App(tk.Tk):
         text_widget.configure(state=tk.NORMAL)
         text_widget.delete("1.0", tk.END)
         text_widget.configure(state=tk.DISABLED)
+        self._update_matrix_rain()
 
     def _browse_yaml(self) -> None:
         if self._current_source == "Cisco ASA":
@@ -4061,6 +4245,7 @@ class App(tk.Tk):
         self._set_buttons_state(tk.DISABLED)
         self._running = True
         self.status_var.set(f"Running: {label}...")
+        self._update_matrix_rain()
 
         # Snapshot every secret as a plain string on the Tk main thread. Tk
         # variables must never be read from the worker thread, so the worker
@@ -4154,6 +4339,7 @@ class App(tk.Tk):
                     self._running = False
                     self._set_buttons_state(tk.NORMAL)
                     self.status_var.set("Ready")
+                    self._update_matrix_rain()
                     return
                 self._append_output(widget, text)
         except queue.Empty:

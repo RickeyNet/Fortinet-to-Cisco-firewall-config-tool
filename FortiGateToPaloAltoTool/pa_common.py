@@ -65,6 +65,22 @@ MGMT_HA_INTERFACE_NAMES = frozenset({
     "mgmt", "mgmt1", "mgmt2", "management", "ha", "ha1", "ha2",
 })
 
+# FortiGate factory-default virtual interfaces. These ship on every appliance
+# and have no meaning on the target firewall: the SSL-VPN (ssl.<vdom>),
+# L2TP (l2t.<vdom>), and NAF (naf.<vdom>) tunnels exist once per VDOM, plus
+# the built-in modem interface.
+DEFAULT_FORTIGATE_VIRTUAL_INTERFACES = frozenset({"modem"})
+_DEFAULT_VIRTUAL_INTERFACE_PREFIXES = ("ssl.", "l2t.", "naf.")
+
+
+def is_default_fortigate_interface(name: Any) -> bool:
+    """Return True if *name* is a FortiGate factory-default virtual interface."""
+    if name is None:
+        return False
+    nm = str(name).strip().lower()
+    return (nm in DEFAULT_FORTIGATE_VIRTUAL_INTERFACES
+            or nm.startswith(_DEFAULT_VIRTUAL_INTERFACE_PREFIXES))
+
 
 def _interface_name_list(value: Any) -> List[str]:
     """Normalize a FortiGate interface-list value to a list of names.

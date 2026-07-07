@@ -1,7 +1,7 @@
 """Regression tests for the FortiGate->FTD converter code-review fixes.
 
 Covers the High-severity findings:
-  H1 - disabled FortiGate policies are not converted
+  H1 - disabled FortiGate policies are converted but exported separately
   H2 - rules whose services all filtered out fail closed (skip, not any-service)
   H3 - 'dst:src' port ranges keep the destination and drop the source ports
   H4 - a TCP service merely named "ping" is not converted to ICMP objects
@@ -21,9 +21,9 @@ from interface_converter import InterfaceConverter  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# H1: disabled policies
+# H1: disabled policies - converted, but kept out of the live import list
 # ---------------------------------------------------------------------------
-def test_disabled_policy_is_not_converted():
+def test_disabled_policy_converted_to_separate_list():
     cfg = {"firewall_policy": [
         {1: {"name": "dead_rule", "status": "disable", "action": "accept",
              "srcaddr": "all", "dstaddr": "all", "service": "ALL"}},
@@ -33,10 +33,20 @@ def test_disabled_policy_is_not_converted():
     conv = PolicyConverter(cfg)
     rules = conv.convert()
 
+    # Live import list contains only the enabled rule
     assert [r["name"] for r in rules] == ["live_rule"]
+
+    # The disabled rule is fully converted into the separate list, tagged
+    # with the _migration marker (not an FDM field)
+    assert [r["name"] for r in conv.disabled_access_rules] == ["dead_rule"]
+    disabled = conv.disabled_access_rules[0]
+    assert disabled["ruleAction"] == "PERMIT"
+    assert disabled["_migration"]["sourceStatus"] == "disable"
+
     stats = conv.get_statistics()
     assert stats["disabled_rules"] == 1
-    assert any(f["reason"] == "disabled in source config" for f in conv.failed_items)
+    # Converted, not a failure - must not appear in failed_items
+    assert not any("disabled" in f.get("reason", "") for f in conv.failed_items)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +320,29 @@ def test_unsupported_interface_types_are_reported():
     assert "unsupported interface type" in reasons["vdlink0"]
     assert conv.stats["skipped"] >= 3
     # the physical interface still converts normally
+    assert len(res["physical_interfaces"]) == 1
+
+
+def test_default_virtual_interfaces_ignored_silently():
+    """Factory-default virtual interfaces (ssl./l2t./naf. per-VDOM tunnels,
+    modem) are ignored without failed_items entries - unlike user-created
+    tunnels, which are still reported."""
+    cfg = {"system_interface": [
+        {"naf.root": {"vdom": "root", "status": "down", "type": "tunnel"}},
+        {"l2t.root": {"vdom": "root", "type": "tunnel"}},
+        {"ssl.root": {"vdom": "root", "type": "tunnel", "alias": "SSL VPN interface"}},
+        {"ssl.customer1": {"vdom": "customer1", "type": "tunnel"}},  # multi-VDOM variant
+        {"modem": {"type": "physical"}},
+        {"vpn_to_hq": {"type": "tunnel"}},  # user tunnel - still reported
+        {"port1": {"type": "physical", "ip": ["10.0.0.1", "255.255.255.0"]}},
+    ]}
+    conv = InterfaceConverter(cfg, target_model="ftd-3120", custom_ha_port="none")
+    res = conv.convert()
+
+    reported = {f["name"] for f in conv.failed_items}
+    for default_name in ("naf.root", "l2t.root", "ssl.root", "ssl.customer1", "modem"):
+        assert default_name not in reported
+    assert "vpn_to_hq" in reported
     assert len(res["physical_interfaces"]) == 1
 
 

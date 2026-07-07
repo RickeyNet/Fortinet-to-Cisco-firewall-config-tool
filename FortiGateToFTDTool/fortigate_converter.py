@@ -761,6 +761,7 @@ Supported FTD Models:
 
     # Convert FortiGate policies to FTD access rules
     access_rules = policy_converter.convert()
+    disabled_access_rules = policy_converter.disabled_access_rules
 
     # Get statistics about the conversion
     policy_stats = policy_converter.get_statistics()
@@ -768,7 +769,8 @@ Supported FTD Models:
     print(f"  - PERMIT rules: {policy_stats['permit_rules']}")
     print(f"  - DENY rules: {policy_stats['deny_rules']}")
     if policy_stats.get('disabled_rules', 0) > 0:
-        print(f"  - Skipped (disabled in source config): {policy_stats['disabled_rules']}")
+        print(f"  - Converted as disabled (exported separately, not imported): "
+              f"{policy_stats['disabled_rules']}")
     if policy_stats.get('fail_closed_skipped', 0) > 0:
         print(f"  - Skipped (all src/dst/services filtered - fail closed): "
               f"{policy_stats['fail_closed_skipped']}")
@@ -811,6 +813,7 @@ Supported FTD Models:
     service_objects_output = f"{args.output}_service_objects.json"
     service_groups_output = f"{args.output}_service_groups.json"
     access_rules_output = f"{args.output}_access_rules.json"
+    disabled_rules_output = f"{args.output}_access_rules_disabled.json"
     static_routes_output = f"{args.output}_static_routes.json"
     physical_interfaces_output = f"{args.output}_physical_interfaces.json"
     subinterfaces_output = f"{args.output}_subinterfaces.json"
@@ -853,6 +856,14 @@ Supported FTD Models:
 
         write_json_file(access_rules_output, access_rules, args.pretty)
         print(f"[OK] Access rules saved to: {access_rules_output}")
+
+        # Rules disabled in the source config, converted for reference. Kept
+        # out of the live import file because FDM cannot disable access rules
+        # - importing one would make it ACTIVE.
+        if disabled_access_rules:
+            write_json_file(disabled_rules_output, disabled_access_rules, args.pretty)
+            print(f"[OK] Disabled access rules saved to: {disabled_rules_output} "
+                  f"(reference only - NOT imported)")
 
         write_json_file(static_routes_output, static_routes, args.pretty)
         print(f"[OK] Static routes saved to: {static_routes_output}")
@@ -917,7 +928,7 @@ Supported FTD Models:
                     "total": policy_stats['total_rules'],
                     "permit": policy_stats['permit_rules'],
                     "deny": policy_stats['deny_rules'],
-                    "disabled_skipped": policy_stats.get('disabled_rules', 0),
+                    "disabled_exported": policy_stats.get('disabled_rules', 0),
                     "fail_closed_skipped": policy_stats.get('fail_closed_skipped', 0)
                 },
                 "static_routes": {

@@ -149,6 +149,10 @@ class PolicyConverter:
         self.permit_count = 0
         self.deny_count = 0
         self.disabled_count = 0  # policies disabled in the source config
+        # Disabled policies are converted like any other rule but exported
+        # separately: FDM access rules have no disabled flag, so putting them
+        # in the live import file would activate dead rules.
+        self.disabled_access_rules: List[Dict] = []
         self.fail_closed_count = 0  # rules skipped because a match list emptied out
 
         # Track items that failed/were skipped during conversion
@@ -210,17 +214,11 @@ class PolicyConverter:
             # ================================================================
             policy_name_raw = properties.get('name', f'Policy_{policy_id}')
 
-            # Disabled policies are NOT converted (FDM access rules have no
-            # disabled flag, so importing them would activate dead rules).
-            if str(properties.get('status', 'enable')).strip().lower() == 'disable':
-                print(f"  Skipped: [{policy_id}] {policy_name_raw} (disabled in source config)")
-                self.disabled_count += 1
-                self.failed_items.append({
-                    "name": str(policy_name_raw),
-                    "reason": "disabled in source config",
-                    "config": properties,
-                })
-                continue
+            # Disabled policies are converted normally but routed to the
+            # separate disabled-rules output (see the append below): FDM
+            # access rules have no disabled flag, so putting them in the live
+            # import file would activate dead rules.
+            is_disabled = str(properties.get('status', 'enable')).strip().lower() == 'disable'
 
             policy_name = sanitize_name(policy_name_raw)
 
@@ -295,12 +293,6 @@ class PolicyConverter:
                 })
                 continue
 
-            # Track statistics (only for rules that are actually emitted)
-            if ftd_action == 'PERMIT':
-                self.permit_count += 1
-            else:
-                self.deny_count += 1
-
             # ================================================================
             # STEP 2G: Create the FTD access rule structure
             # ================================================================
@@ -317,19 +309,44 @@ class PolicyConverter:
                 "logFiles": False,
                 "type": "accessrule"
             }
-            
-            # Add the converted rule to our result list
-            access_rules.append(ftd_rule)
-            
-            # Increment rule ID for next rule
+
+            # Increment rule ID for next rule (disabled rules consume an ID
+            # too, so their original position among the active rules stays
+            # visible in the exported files)
             rule_id_counter += 1
-            
+
             # ================================================================
-            # STEP 2H: Print conversion details for user feedback
+            # STEP 2H: Route the rule and print conversion details
             # ================================================================
             src_count = len(ftd_source_networks)
             dst_count = len(ftd_dest_networks)
             svc_count = len(ftd_dest_ports)
+
+            if is_disabled:
+                # The "_migration" key is not an FDM field - strip it before
+                # ever sending this payload to the API.
+                ftd_rule["_migration"] = {
+                    "sourceStatus": "disable",
+                    "note": "Disabled in the FortiGate config. FDM cannot "
+                            "disable access rules - importing this rule "
+                            "would make it ACTIVE.",
+                }
+                self.disabled_access_rules.append(ftd_rule)
+                self.disabled_count += 1
+                print(f"  Converted (disabled): [{policy_id}] {policy_name} -> {ftd_action} "
+                      f"(Src:{src_count} Dst:{dst_count} Svc:{svc_count}) "
+                      f"[exported separately, not imported]")
+                continue
+
+            # Track statistics (only for rules emitted into the live import file)
+            if ftd_action == 'PERMIT':
+                self.permit_count += 1
+            else:
+                self.deny_count += 1
+
+            # Add the converted rule to our result list
+            access_rules.append(ftd_rule)
+
             print(f"  Converted: [{policy_id}] {policy_name} -> {ftd_action} "
                   f"(Src:{src_count} Dst:{dst_count} Svc:{svc_count})")
         
@@ -684,7 +701,7 @@ class PolicyConverter:
             "total_rules": len(self.ftd_access_rules),
             "permit_rules": self.permit_count,
             "deny_rules": self.deny_count,
-            "disabled_rules": self.disabled_count,  # disabled in source, not converted
+            "disabled_rules": self.disabled_count,  # disabled in source, exported separately
             "fail_closed_skipped": self.fail_closed_count  # skipped to avoid broadening
         }
 
