@@ -198,35 +198,43 @@ This checklist tracks technical debt, performance hardening, and usability impro
 
 ## P3: Test Coverage Expansion
 
-- [ ] Add unit tests for address converter
+- [x] Add unit tests for address converter
   - Scope: Test HOST/NETWORK/RANGE/FQDN detection, netmask-to-CIDR conversion,
     IP-address-name filtering, name sanitization edge cases.
-  - Priority: Medium - converter logic is core to correctness.
+  - Done: `tests/test_address_converter.py` (20 tests) — subtype detection, netmask-to-CIDR,
+    factory-default/invalid filtering, name sanitization and collision handling, value validation.
 
-- [ ] Add unit tests for service converter
+- [x] Add unit tests for service converter
   - Scope: Test TCP/UDP splitting, multi-port expansion, ICMP skipping,
     FTD built-in name collision handling, colon-separated port parsing.
-  - Priority: Medium - split logic is complex and error-prone.
+  - Done: `tests/test_service_converter.py` (21 tests) — TCP/UDP splitting, multi-port expansion,
+    ICMP/IP-protocol skipping, colon-separated ports, built-in name collisions, name mapping.
 
-- [ ] Add unit tests for policy converter
+- [x] Add unit tests for policy converter
   - Scope: Test action mapping, zone lookup strategies, service expansion,
     address group type detection, "any"/"all" filtering.
-  - Priority: Medium - policy conversion involves multiple lookup strategies.
+  - Done: `tests/test_policy_converter.py` (27 tests) — action mapping, zone lookup, service/address
+    expansion, group type detection, "any"/"all" filtering. Fail-closed/disabled rules in
+    `tests/test_converter_fixes.py`.
 
-- [ ] Add unit tests for interface converter
+- [x] Add unit tests for interface converter
   - Scope: Test physical/aggregate/switch/VLAN detection, port mapping per model,
     HA port exclusion, name sanitization, security zone generation.
-  - Priority: Medium - model-specific logic needs coverage.
+  - Done: `tests/test_interface_converter_basics.py` (20 tests) — physical/aggregate/switch/VLAN
+    detection, per-model port universes, name sanitization, security zones. HA port exclusion
+    in `tests/test_ftd_ha_ports.py`.
 
-- [ ] Add unit tests for group flattening (address & service groups)
+- [x] Add unit tests for group flattening (address & service groups)
   - Scope: Test circular reference detection, deep nesting, duplicate removal,
     single-member normalization, empty group handling.
-  - Priority: Low - logic is straightforward but edge cases matter.
+  - Done: `tests/test_group_flattening.py` (20 tests) — shared `build_group_lookup()` /
+    `flatten_group_members()` helpers plus address and service group converter edge cases.
 
-- [ ] Add integration-style test for `fortigate_converter.py` main()
+- [x] Add integration-style test for `fortigate_converter.py` main()
   - Scope: Feed a small YAML config through `main()` and verify all 13 JSON output files
     are created with correct structure.
-  - Priority: Low - would catch regressions in the orchestration layer.
+  - Done: `tests/test_fortigate_converter_main.py` (14 tests) — end-to-end YAML through `main()`,
+    all 14 output files (including metadata/summary), YAML pre-processing, disabled-policy export.
 
 ---
 
