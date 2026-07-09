@@ -696,7 +696,9 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self._set_window_title(f"Firewall Migration Tool v{APP_VERSION}")
-        self.geometry("960x720")
+        # Wide enough that the Convert tab's side-by-side layout (settings
+        # left, console right) leaves usable console room at launch.
+        self.geometry("1280x720")
         self.minsize(800, 600)
 
         # Window icon - load from bundle dir when frozen, project dir otherwise.
@@ -1477,10 +1479,21 @@ class App(tk.Tk):
         tab = ttk.Frame(notebook)
         notebook.add(tab, text="  Convert  ")
 
+        # Settings on the left, console output on the right (same layout as
+        # the SNMP tab). The sash is draggable.
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # The settings column can outgrow the window (aggregation builder),
+        # so make it scrollable to keep the action buttons reachable.
+        left_container, left = self._make_scrollable(paned)
+        paned.add(left_container, weight=0)
+        right = ttk.Frame(paned)
+        paned.add(right, weight=1)
+
         # How-to banner for exporting the FortiGate config (FortiGate source only;
         # toggled in _on_source_change via _set_fortinet_help_visible()).
         self.conv_fortinet_help = ttk.Label(
-            tab,
+            left,
             text=("ℹ  How to get the FortiGate config file:  on your FortiGate, "
                   "click the user menu (top-right) → Configuration → Backup → "
                   "select YAML → OK to download.  Then click Browse… below to "
@@ -1489,7 +1502,7 @@ class App(tk.Tk):
         )
         self.conv_fortinet_help.pack(fill=tk.X, padx=10, pady=(8, 0), anchor=tk.W)
 
-        opts = ttk.LabelFrame(tab, text="Conversion Options", padding=10)
+        opts = ttk.LabelFrame(left, text="Conversion Options", padding=10)
         self._conv_opts_frame = opts
         opts.pack(fill=tk.X, padx=8, pady=(8, 4))
 
@@ -1592,10 +1605,10 @@ class App(tk.Tk):
         opts.columnconfigure(1, weight=1)
 
         # Interface aggregation builder (FortiGate->FTD only; hidden otherwise)
-        self._build_aggregation_section(tab)
+        self._build_aggregation_section(left)
 
         # Buttons
-        btn_frame = ttk.Frame(tab)
+        btn_frame = ttk.Frame(left)
         btn_frame.pack(fill=tk.X, padx=8, pady=4)
         self._conv_btn_frame = btn_frame
         self.conv_run_btn = ttk.Button(
@@ -1612,7 +1625,7 @@ class App(tk.Tk):
             command=lambda: self._clear_output(self.conv_output),
         ).pack(side=tk.LEFT, padx=8)
 
-        self.conv_output = self._make_output_area(tab)
+        self.conv_output = self._make_output_area(right)
 
         # Sync builder visibility with the initial source/target selection.
         self._update_aggregation_visibility()

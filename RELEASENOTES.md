@@ -183,6 +183,9 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 **GUI - per-platform cleanup options and usability**
 
 - Cleanup option table is now validated against each tool's argparse, so only valid flags are shown for the active source/target combination.
+- Convert and SNMP tabs use a side-by-side layout: settings on the left (scrollable, so action buttons are never clipped off-screen), console output on the right, with a draggable divider. Default window size widened to 1280x720 to fit.
+- SNMP trap-events panel gained a "Select all" checkbox.
+- Interface Aggregation builder column titles now sit directly above their fields.
 - Secrets snapshotted off the Tk thread before async worker launch.
 - Confirm-on-close dialog when an operation is in progress.
 - Stale aggregation rows cleared when the target platform changes.
@@ -194,7 +197,7 @@ Deleting EtherChannels (and bridge groups) failed on HA-enabled appliances with 
 - Non-ASCII dashes (em/en) in documentation and comments normalized to ASCII hyphens.
 - Bare `except:` and broad `except Exception` handlers narrowed to specific exception tuples across all tools.
 - Dead code (unused imports, unused locals) removed.
-- Test suite grew from 22 to 228 passing tests with new conftest.py for reliable import ordering.
+- Test suite grew from 22 to 363 passing tests with new conftest.py for reliable import ordering.
 
 ---
 

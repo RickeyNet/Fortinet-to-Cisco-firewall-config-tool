@@ -31,3 +31,4 @@ version_info.txt
 
 # Test artifacts
 test_extract.png
+.coverage
